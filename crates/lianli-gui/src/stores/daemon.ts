@@ -32,6 +32,7 @@ export const useDaemonStore = defineStore("daemon", () => {
   const connected = ref(false);
   const socketPath = ref("");
   const streamingActive = ref(false);
+  const nightModeActive = ref(false);
   const mediaPreparation = ref<NonNullable<TelemetrySnapshot["media_preparation"]>>({});
   const desktopStreams = ref<NonNullable<TelemetrySnapshot["desktop_streams"]>>([]);
   const info = ref<DaemonInfo | null>(null);
@@ -58,6 +59,7 @@ export const useDaemonStore = defineStore("daemon", () => {
       writeError.value = result.write_error ?? null;
       socketPath.value = result.socket_path;
       streamingActive.value = result.telemetry.streaming_active;
+      nightModeActive.value = result.telemetry.night_mode_active ?? false;
       mediaPreparation.value = result.telemetry.media_preparation ?? {};
       desktopStreams.value = result.telemetry.desktop_streams ?? [];
       openrgbRunning.value = result.telemetry.openrgb_status.running;
@@ -90,6 +92,7 @@ export const useDaemonStore = defineStore("daemon", () => {
       wasConnected = result.connected;
     } catch (e) {
       connected.value = false;
+      nightModeActive.value = false;
       mediaPreparation.value = {};
       desktopStreams.value = [];
       info.value = null;
@@ -120,6 +123,7 @@ export const useDaemonStore = defineStore("daemon", () => {
     canWrite,
     socketPath,
     streamingActive,
+    nightModeActive,
     mediaPreparation,
     desktopStreams,
     version,

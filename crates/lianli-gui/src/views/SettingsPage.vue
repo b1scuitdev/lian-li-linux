@@ -19,6 +19,24 @@ const daemon = useDaemonStore();
 const config = useConfigStore();
 const thermal = useThermalStore();
 const ipc = useIpc();
+const togglingNightMode = ref(false);
+const nightModeError = ref("");
+watch(() => daemon.info?.instance_id, () => { nightModeError.value = ""; });
+async function setNightMode(enabled: boolean) {
+  if (togglingNightMode.value || !daemon.canWrite) return;
+  const instance = daemon.info?.instance_id;
+  togglingNightMode.value = true;
+  nightModeError.value = "";
+  try {
+    await ipc.request("SetNightMode", { enabled }, instance);
+  } catch (error) {
+    if (daemon.info?.instance_id === instance) nightModeError.value = String(error);
+  } finally {
+    await daemon.refresh();
+    if (daemon.nightModeActive !== enabled) await daemon.refresh();
+    togglingNightMode.value = false;
+  }
+}
 const retryingOpenRgb = ref(false);
 const openrgbFeedback = ref("");
 watch(() => daemon.info?.instance_id, () => { openrgbFeedback.value = ""; });
@@ -124,6 +142,18 @@ function onHidBackend(v: "hidraw" | "rusb") {
       <div class="section-head">
         <h2 class="section-title">Configuration</h2>
       </div>
+      <div class="kv">
+        <span class="muted">Night Mode</span>
+        <n-switch
+          :value="daemon.nightModeActive"
+          :loading="togglingNightMode"
+          :disabled="togglingNightMode || !daemon.canWrite || !daemon.info?.capabilities.includes('night_mode')"
+          aria-label="Night Mode"
+          @update:value="setNightMode"
+        />
+      </div>
+      <p class="hint">Temporarily turns off supported LCD backlights and RGB lighting. Fan and pump control are unaffected. Night Mode takes priority over thermal alert lighting.</p>
+      <n-alert v-if="nightModeError" type="error">{{ nightModeError }}</n-alert>
       <div class="kv"><span class="muted">HID Backend</span>
         <n-select
           :value="config.config.hid_backend"

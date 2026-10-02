@@ -1041,6 +1041,9 @@ pub(crate) struct ActiveTarget {
     recovery_unsupported: bool,
     // Latest value waiting for initialization, the device lock, or HID write spacing.
     pending_brightness: Option<u8>,
+    normal_brightness: Option<u8>,
+    configured_brightness: Option<u8>,
+    night_mode_active: bool,
     brightness_status: Option<lianli_shared::ipc::LcdBrightnessStatus>,
     brightness_retries: u8,
     next_brightness_attempt: Option<Instant>,
@@ -1137,6 +1140,9 @@ impl ActiveTarget {
             initialization: LcdInitialization::Ready,
             recovery_unsupported: false,
             pending_brightness: None,
+            normal_brightness: None,
+            configured_brightness: None,
+            night_mode_active: false,
             brightness_status: None,
             brightness_retries: 0,
             next_brightness_attempt: None,
@@ -1239,6 +1245,63 @@ impl ActiveTarget {
         builder: &mut PacketBuilder,
         brightness: u8,
     ) {
+        self.normal_brightness = Some(brightness);
+        self.deliver_brightness(wireless, builder, brightness);
+    }
+
+    pub(super) fn apply_config_brightness(
+        &mut self,
+        wireless: Option<&WirelessController>,
+        builder: &mut PacketBuilder,
+        brightness: u8,
+    ) {
+        if self.configured_brightness != Some(brightness) {
+            self.configured_brightness = Some(brightness);
+            self.apply_brightness(wireless, builder, brightness);
+        }
+    }
+
+    pub(super) fn set_night_mode(
+        &mut self,
+        wireless: Option<&WirelessController>,
+        builder: &mut PacketBuilder,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if self.night_mode_active != enabled {
+            self.night_mode_active = enabled;
+            self.reapply_brightness(wireless, builder);
+        }
+        match self
+            .brightness_status
+            .as_ref()
+            .and_then(|status| status.error.as_ref())
+        {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn reapply_brightness(
+        &mut self,
+        wireless: Option<&WirelessController>,
+        builder: &mut PacketBuilder,
+    ) {
+        if let Some(brightness) = self.normal_brightness {
+            self.deliver_brightness(wireless, builder, brightness);
+        }
+    }
+
+    fn deliver_brightness(
+        &mut self,
+        wireless: Option<&WirelessController>,
+        builder: &mut PacketBuilder,
+        brightness: u8,
+    ) {
+        let brightness = if self.night_mode_active {
+            0
+        } else {
+            brightness
+        };
         if self.removal.is_some() {
             return;
         }
@@ -1267,6 +1330,11 @@ impl ActiveTarget {
     ) -> Result<bool, String> {
         if self.removal.is_some() {
             return Err("LCD is being removed".into());
+        }
+        if self.night_mode_active && brightness != 0 {
+            return Err(
+                "Night Mode controls LCD brightness. Disable it before changing brightness.".into(),
+            );
         }
         self.apply_brightness(wireless, builder, brightness);
         if let Some(status) = &mut self.brightness_status {
@@ -3231,6 +3299,87 @@ mod tests {
         assert_eq!(brightness.load(Ordering::Relaxed), 30);
         assert!(target.pending_brightness.is_none());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn night_mode_restores_live_brightness_without_replacing_media() {
+        let (mut target, _, brightness) = brightness_target();
+        let mut builder = PacketBuilder::new();
+        let asset = target.asset.clone();
+        target.apply_config_brightness(None, &mut builder, 37);
+        target.next_brightness_attempt = None;
+        assert!(target
+            .request_brightness(None, &mut builder, 23, None)
+            .unwrap());
+        target.next_brightness_attempt = None;
+        target.set_night_mode(None, &mut builder, true).unwrap();
+        assert_eq!(brightness.load(Ordering::Relaxed), 0);
+        target.set_night_mode(None, &mut builder, true).unwrap();
+        target.apply_config_brightness(None, &mut builder, 37);
+        assert!(target
+            .request_brightness(None, &mut builder, 90, Some("blocked".into()))
+            .unwrap_err()
+            .contains("Night Mode"));
+        assert_eq!(target.brightness_status().unwrap().brightness, 0);
+        assert!(target.brightness_status().unwrap().request_id.is_none());
+        target.next_brightness_attempt = None;
+        target.set_night_mode(None, &mut builder, false).unwrap();
+        target.set_night_mode(None, &mut builder, false).unwrap();
+        assert_eq!(brightness.load(Ordering::Relaxed), 23);
+        assert!(Arc::ptr_eq(&target.asset, &asset));
+        assert!(!target.custom_h264);
+    }
+
+    #[test]
+    fn night_mode_supersedes_pending_brightness_and_survives_initialization_and_reapply() {
+        let (mut target, _, brightness) = brightness_target();
+        let mut builder = PacketBuilder::new();
+        target.wait_for_initialization();
+        target.apply_config_brightness(None, &mut builder, 45);
+        target.set_night_mode(None, &mut builder, true).unwrap();
+        target.apply_config_brightness(None, &mut builder, 64);
+        target.finish_initialization(None);
+        target.flush_pending_brightness(None, &mut builder);
+        assert_eq!(brightness.load(Ordering::Relaxed), 0);
+        brightness.store(80, Ordering::Relaxed);
+        target.next_brightness_attempt = None;
+        target.reapply_brightness(None, &mut builder);
+        assert_eq!(brightness.load(Ordering::Relaxed), 0);
+        target.next_brightness_attempt = None;
+        target.set_night_mode(None, &mut builder, false).unwrap();
+        assert_eq!(brightness.load(Ordering::Relaxed), 64);
+    }
+
+    #[test]
+    fn night_mode_replaces_failed_normal_brightness_retries() {
+        let (mut target, _, brightness) = brightness_target_with_failures(1);
+        let mut builder = PacketBuilder::new();
+        target.apply_config_brightness(None, &mut builder, 57);
+        assert!(target.brightness_status().unwrap().error.is_some());
+        target.set_night_mode(None, &mut builder, true).unwrap();
+        target.next_brightness_attempt = None;
+        target.flush_pending_brightness(None, &mut builder);
+        assert_eq!(brightness.load(Ordering::Relaxed), 0);
+        assert!(target.brightness_status().unwrap().error.is_none());
+        target.next_brightness_attempt = None;
+        target.set_night_mode(None, &mut builder, false).unwrap();
+        assert_eq!(brightness.load(Ordering::Relaxed), 57);
+    }
+
+    #[test]
+    fn lcd_attached_during_night_mode_never_queues_configured_nonzero_brightness() {
+        let (mut target, _, brightness) = brightness_target();
+        let mut builder = PacketBuilder::new();
+        target.set_night_mode(None, &mut builder, true).unwrap();
+        target.wait_for_initialization();
+        target.apply_config_brightness(None, &mut builder, 42);
+        assert_eq!(target.brightness_status().unwrap().brightness, 0);
+        target.finish_initialization(None);
+        target.flush_pending_brightness(None, &mut builder);
+        assert_eq!(brightness.load(Ordering::Relaxed), 0);
+        target.next_brightness_attempt = None;
+        target.set_night_mode(None, &mut builder, false).unwrap();
+        assert_eq!(brightness.load(Ordering::Relaxed), 42);
     }
 
     #[test]

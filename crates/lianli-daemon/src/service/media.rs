@@ -417,6 +417,13 @@ impl ServiceManager {
 
                 let cfg_key = asset.config_key.clone();
                 if let Some(mut existing) = self.take_target(cfg_idx) {
+                    if existing.device_identity == candidate.device_id {
+                        existing.apply_config_brightness(
+                            Some(&self.wireless),
+                            &mut self.packet_builder,
+                            device_cfg.brightness(),
+                        );
+                    }
                     if existing.matches(&candidate.device_id, &cfg_key) {
                         // Media is unchanged, but the custom_h264 toggle may have
                         // flipped — rebuild the frame source so the H.264 pipeline
@@ -644,6 +651,13 @@ impl ServiceManager {
                             applied_cfg.custom_h264(),
                             self.tx.clone(),
                         );
+                        if let Err(error) = target.set_night_mode(
+                            Some(&self.wireless),
+                            &mut self.packet_builder,
+                            self.night_mode_active,
+                        ) {
+                            warn!("LCD Night Mode initialization failed: {error}");
+                        }
                         if init_pending {
                             target.wait_for_initialization();
                         }
@@ -655,7 +669,7 @@ impl ServiceManager {
                         {
                             let brightness = device_cfg.brightness();
                             if let Some(t) = new_targets.get_mut(&cfg_idx) {
-                                t.apply_brightness(
+                                t.apply_config_brightness(
                                     Some(&self.wireless),
                                     &mut self.packet_builder,
                                     brightness,

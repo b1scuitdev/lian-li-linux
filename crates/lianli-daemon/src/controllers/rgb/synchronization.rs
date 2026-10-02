@@ -120,6 +120,7 @@ impl RgbController {
     }
 
     pub(super) fn ensure_individual_control(&self, id: &str) -> Result<()> {
+        self.ensure_night_mode_inactive()?;
         anyhow::ensure!(
             self.is_openrgb_controlled() || !self.sync_active.contains(id),
             "disable RGB sync for {id} before changing its individual lighting"

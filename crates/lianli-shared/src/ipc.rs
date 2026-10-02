@@ -46,6 +46,9 @@ pub enum IpcRequest {
         config: FanConfig,
     },
     GetTelemetry,
+    SetNightMode {
+        enabled: bool,
+    },
     /// Get RGB capabilities for all devices.
     GetRgbCapabilities,
     /// Set RGB effect for a specific device zone. Software effects acknowledge
@@ -316,6 +319,7 @@ impl IpcRequest {
             | Self::SetConfig { .. }
             | Self::SetLcdMedia { .. }
             | Self::SetFanConfig { .. }
+            | Self::SetNightMode { .. }
             | Self::SetRgbEffect { .. }
             | Self::SetRgbDirect { .. }
             | Self::SetRgbFrames { .. }
@@ -614,6 +618,8 @@ pub struct DesktopStreamStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetrySnapshot {
     #[serde(default)]
+    pub night_mode_active: bool,
+    #[serde(default)]
     pub lcd_brightness: HashMap<String, LcdBrightnessStatus>,
     #[serde(default)]
     pub desktop_streams: Vec<DesktopStreamStatus>,
@@ -646,6 +652,35 @@ pub struct LcdBrightnessStatus {
 #[cfg(test)]
 mod quantity_tests {
     use super::*;
+
+    #[test]
+    fn night_mode_wire_format_and_legacy_telemetry() {
+        let request: IpcRequest = serde_json::from_value(serde_json::json!({
+            "method": "SetNightMode", "params": { "enabled": true }
+        }))
+        .unwrap();
+        assert!(matches!(
+            request,
+            IpcRequest::SetNightMode { enabled: true }
+        ));
+        assert!(!request.is_read_only());
+        let mut telemetry = serde_json::to_value(TelemetrySnapshot::default()).unwrap();
+        telemetry
+            .as_object_mut()
+            .unwrap()
+            .remove("night_mode_active");
+        assert!(
+            !serde_json::from_value::<TelemetrySnapshot>(telemetry.clone())
+                .unwrap()
+                .night_mode_active
+        );
+        telemetry["night_mode_active"] = true.into();
+        assert!(
+            serde_json::from_value::<TelemetrySnapshot>(telemetry)
+                .unwrap()
+                .night_mode_active
+        );
+    }
 
     #[test]
     fn brightness_status_is_optional_for_older_daemons() {

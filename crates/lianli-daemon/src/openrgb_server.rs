@@ -239,6 +239,7 @@ fn run_server(
         (caps, revision, observed, groups)
     };
     let mut legacy_states = legacy::states(&caps, &Default::default(), &rgb.lock());
+    let mut output_resume_generation = rgb.lock().output_resume_generation();
     let mut delivery_devices: std::collections::HashMap<_, _> = {
         let rgb = rgb.lock();
         caps.iter()
@@ -251,6 +252,9 @@ fn run_server(
         clients.reap();
         let current_revision = revision.load(Ordering::Acquire);
         if current_revision != observed_revision {
+            let resumed = rgb.lock().output_resume_generation();
+            let output_resumed = resumed != output_resume_generation;
+            output_resume_generation = resumed;
             let current = rgb.lock().exposed_capabilities();
             if current != caps {
                 // Existing clients must not send commands using reassigned device indexes.
@@ -278,7 +282,7 @@ fn run_server(
                     .filter_map(|id| rgb.delivery_device(id).map(|device| (id.clone(), device)))
                     .collect()
             };
-            let changed: std::collections::HashSet<_> = current_devices
+            let mut changed: std::collections::HashSet<_> = current_devices
                 .iter()
                 .filter(|(id, (device, generation))| {
                     delivery_devices
@@ -289,6 +293,9 @@ fn run_server(
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
+            if output_resumed {
+                changed.extend(caps.iter().map(|cap| cap.device_id.clone()));
+            }
             for id in &changed {
                 if let Some(group) = groups.get(id) {
                     group.lock().queue_current(&direct_buffer);

@@ -460,12 +460,21 @@ impl ServiceManager {
                         self.startup_image_quarantine.insert(job.identity.clone());
                         target.stop();
                     } else {
+                        if let Err(error) = target.set_night_mode(
+                            Some(&self.wireless),
+                            &mut self.packet_builder,
+                            self.night_mode_active,
+                        ) {
+                            tracing::warn!(%error, "LCD Night Mode restoration failed after startup upload");
+                        }
                         if outcome.stopped {
                             target.swap_media(
                                 target.asset.clone(),
                                 target.custom_h264,
                                 self.tx.clone(),
                             );
+                            target
+                                .reapply_brightness(Some(&self.wireless), &mut self.packet_builder);
                         }
                         self.targets.lock().insert(target.index, target);
                     }

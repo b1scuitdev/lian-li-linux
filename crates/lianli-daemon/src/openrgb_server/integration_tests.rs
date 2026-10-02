@@ -239,6 +239,45 @@ fn ordinary_device_colours_are_replayed_after_hardware_invalidation() {
     }
 }
 
+#[test]
+fn night_mode_release_replays_openrgb_session_without_disconnecting_the_client() {
+    let server = Server::new(false);
+    let mut client = server.connect(6);
+    let colors = vec![[9, 8, 7]; 4];
+    let mut payload = Vec::new();
+    protocol::write_colors(&mut payload, &colors);
+    send(
+        &mut client,
+        PKT_UPDATE_LEDS,
+        &protocol::sized_packet(&payload),
+    );
+    assert_colors(&notification(&mut client), &colors);
+    server.buffer.lock().clear();
+    let thermal = crate::thermal_alert::new_shared();
+    *thermal.lock() = Some([255, 128, 0]);
+    server.rgb.lock().set_thermal_override(thermal);
+    server.rgb.lock().set_night_mode(true).unwrap();
+    server.rgb.lock().set_night_mode(false).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(zones) = server.buffer.lock().take_all().get("hid:0416:7395:test") {
+            assert_eq!(zones[&0], [[9, 8, 7]; 2]);
+            assert_eq!(zones[&1], [[9, 8, 7]; 2]);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "No OpenRGB replay after Night Mode"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    send(&mut client, PKT_REQUEST_CONTROLLER_COUNT, &[]);
+    assert_eq!(
+        read_packet_from(&mut client).unwrap().1,
+        PKT_REQUEST_CONTROLLER_COUNT
+    );
+}
+
 fn send_at(peer: &mut TcpStream, index: u32, kind: u32, payload: &[u8]) {
     let mut packet = MAGIC.to_vec();
     packet.extend_from_slice(&index.to_le_bytes());

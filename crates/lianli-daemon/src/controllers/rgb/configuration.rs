@@ -107,15 +107,32 @@ impl RgbController {
         let previous = self.config.replace(config.clone());
         self.presets = presets.to_vec();
         self.openrgb_server_enabled = config.openrgb_server;
+        match self.refresh_output_override(true) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                warn!("RGB override failed: {error:#}");
+                return;
+            }
+        }
+        if let Err(error) = self.apply_config_output(config, presets, previous.as_ref()) {
+            warn!("Failed to apply RGB config: {error:#}");
+        }
+    }
+
+    pub(super) fn apply_config_output(
+        &mut self,
+        config: &RgbAppConfig,
+        presets: &[RgbPreset],
+        previous: Option<&RgbAppConfig>,
+    ) -> anyhow::Result<()> {
         if !config.enabled || self.is_openrgb_controlled() {
             self.clear_pending();
-            return;
+            return Ok(());
         }
-        if self.thermal_override_active() {
-            return;
-        }
+        let mut errors = Vec::new();
         if let Err(error) = self.apply_sync(config) {
-            warn!("Failed to apply RGB synchronization: {error:#}");
+            errors.push(format!("RGB synchronization: {error:#}"));
         }
 
         let removed: Vec<_> = previous
@@ -205,12 +222,11 @@ impl RgbController {
                 Ok(())
             })();
             if let Err(error) = result {
-                warn!(
-                    "Failed to apply RGB config for {}: {error}",
-                    device.device_id
-                );
+                errors.push(format!("{}: {error:#}", device.device_id));
             }
         }
+        anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(())
     }
 
     pub fn saved_group_effects(&self, id: &str) -> anyhow::Result<Vec<RgbEffect>> {

@@ -118,6 +118,30 @@ mod tests {
         assert!(request.authorize(&current()).is_ok());
     }
 
+    #[test]
+    fn night_mode_requires_an_authorized_write_guard() {
+        let daemon = current();
+        let request = IpcRequest::SetNightMode { enabled: true };
+        assert!(request.clone().authorize(&daemon).is_err());
+        let guard = daemon.write_guard(&daemon.version).unwrap();
+        let guarded = IpcRequest::Guarded {
+            guard: guard.clone(),
+            request: Box::new(request.clone()),
+        };
+        assert!(matches!(
+            guarded.authorize(&daemon).unwrap(),
+            IpcRequest::SetNightMode { enabled: true }
+        ));
+        let mut stale = guard;
+        stale.instance_id = "previous-instance".into();
+        assert!(IpcRequest::Guarded {
+            guard: stale,
+            request: Box::new(request)
+        }
+        .authorize(&daemon)
+        .is_err());
+    }
+
     fn current() -> DaemonInfo {
         DaemonInfo {
             version: "1.0.0".into(),

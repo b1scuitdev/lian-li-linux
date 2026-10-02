@@ -3,6 +3,7 @@ mod capabilities;
 mod configuration;
 mod control;
 mod direct_color;
+mod output_override;
 mod playback;
 mod regions;
 mod render;
@@ -57,7 +58,11 @@ pub struct RgbController {
     openrgb_active: bool,
     openrgb_server_enabled: bool,
     thermal_override: crate::thermal_alert::SharedThermalAlert,
-    thermal_last_color: Option<[u8; 3]>,
+    night_mode_active: bool,
+    output_override: Arc<parking_lot::RwLock<Option<RgbEffect>>>,
+    override_revision: Option<u64>,
+    override_error: Option<String>,
+    output_resume_generation: u64,
     last_direct: HashMap<(String, u8), Vec<[u8; 3]>>,
     last_group_effects: HashMap<String, Vec<RgbEffect>>,
     capabilities_revision: Arc<AtomicU64>,
@@ -90,7 +95,11 @@ impl RgbController {
             openrgb_active: false,
             openrgb_server_enabled: false,
             thermal_override: crate::thermal_alert::new_shared(),
-            thermal_last_color: None,
+            night_mode_active: false,
+            output_override: Arc::new(parking_lot::RwLock::new(None)),
+            override_revision: None,
+            override_error: None,
+            output_resume_generation: 0,
             last_direct: HashMap::new(),
             last_group_effects: HashMap::new(),
             capabilities_revision: Arc::new(AtomicU64::new(0)),
@@ -137,7 +146,8 @@ impl RgbController {
         }
         self.wired_renderer.clear();
         self.applied.clear();
-        self.thermal_last_color = None;
+        self.override_revision = None;
+        self.override_error = None;
     }
 
     pub fn set_thermal_override(&mut self, state: crate::thermal_alert::SharedThermalAlert) {
@@ -162,46 +172,10 @@ impl RgbController {
     }
 
     pub fn check_thermal_override(&mut self) -> bool {
-        if self.is_openrgb_controlled() {
-            return false;
+        if let Err(error) = self.refresh_output_override(false) {
+            warn!("RGB override failed: {error:#}");
         }
-        let color = *self.thermal_override.lock();
-        if color != self.thermal_last_color {
-            self.clear_pending();
-            self.mb_sync_state.clear();
-            if let Some(color) = color {
-                let effect = RgbEffect {
-                    colors: vec![color],
-                    ..Default::default()
-                };
-                for cap in self.exposed_capabilities() {
-                    if self.software_controlled(&cap.device_id) {
-                        let mut state = RenderState::new(
-                            cap.zones.iter().map(|z| z.led_count as usize).collect(),
-                        );
-                        for zone in 0..state.counts.len() {
-                            if let Err(error) = state.set_effect(zone as u8, &effect) {
-                                warn!("Thermal RGB effect failed for {}: {error}", cap.device_id);
-                            }
-                        }
-                        if let Err(error) = self.submit_render(&cap.device_id, &mut state) {
-                            warn!("Thermal RGB override failed for {}: {error}", cap.device_id);
-                        }
-                    } else if let Some(device) = self.wired.get(&cap.device_id) {
-                        if let Err(error) = device.set_all_effects(&effect) {
-                            warn!("Thermal RGB override failed for {}: {error}", cap.device_id);
-                        }
-                    }
-                }
-                // The temporary alert must not become the native restore state.
-                self.applied.clear();
-            } else if let Some(config) = self.config.clone() {
-                self.thermal_last_color = None;
-                self.apply_config(&config, &self.presets.clone());
-            }
-            self.thermal_last_color = color;
-        }
-        color.is_some()
+        !self.is_openrgb_controlled() && self.thermal_override_active()
     }
 
     pub fn software_controlled(&self, id: &str) -> bool {
@@ -254,6 +228,7 @@ impl RgbController {
     }
 
     pub fn ping(&self, id: &str, zone: u8) -> anyhow::Result<()> {
+        self.ensure_night_mode_inactive()?;
         if let Some(device) = self.wired.get(id) {
             return device.ping(zone);
         }
@@ -287,6 +262,12 @@ impl RgbController {
             return;
         }
         self.openrgb_active = active;
+        if self.output_override_active() {
+            if let Err(error) = self.refresh_output_override(true) {
+                warn!("RGB override failed: {error:#}");
+            }
+            return;
+        }
         self.clear_pending();
         if !active && !self.openrgb_server_enabled {
             if let Some(config) = self.config.clone() {
@@ -396,7 +377,6 @@ impl RgbController {
         self.capabilities_changed();
         self.configured.retain(|id, _| !id.starts_with("wireless:"));
         self.sync_signature = None;
-        self.thermal_last_color = None;
         let mut devices = HashMap::new();
         if let Some(wireless) = &self.wireless {
             for device in wireless.devices() {
@@ -476,5 +456,7 @@ impl RgbController {
     }
 }
 
+#[cfg(test)]
+mod night_mode_tests;
 #[cfg(test)]
 mod tests;

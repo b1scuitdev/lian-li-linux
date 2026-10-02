@@ -832,6 +832,9 @@ impl ServiceManager {
             .unwrap_or_default();
         let mut monitor = crate::thermal_alert::ThermalAlertMonitor::new(thermal_settings);
         controller.set_thermal_override(monitor.shared_override());
+        if let Err(error) = controller.set_night_mode(self.night_mode_active) {
+            warn!("RGB Night Mode initialization failed: {error:#}");
+        }
         monitor.start();
         self.controllers.thermal_alert = Some(monitor);
 

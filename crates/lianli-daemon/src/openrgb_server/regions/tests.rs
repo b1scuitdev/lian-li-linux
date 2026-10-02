@@ -632,7 +632,9 @@ impl RgbDevice for RecordingDevice {
         "AL V2".into()
     }
     fn supported_modes(&self) -> Vec<RgbMode> {
-        capabilities(3).supported_modes
+        let mut modes = capabilities(3).supported_modes;
+        modes.push(RgbMode::Off);
+        modes
     }
     fn zone_info(&self) -> Vec<RgbZoneInfo> {
         capabilities(3).zones
@@ -650,6 +652,42 @@ impl RgbDevice for RecordingDevice {
         }
         Ok(())
     }
+    fn set_all_effects(&self, effect: &RgbEffect) -> anyhow::Result<()> {
+        self.set_group_effects(std::slice::from_ref(effect))
+    }
+}
+
+#[test]
+fn night_mode_blocks_native_openrgb_groups_and_resumes_pending_palettes() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cap = capabilities(3);
+    let rgb = Arc::new(Mutex::new(RgbController::new(
+        HashMap::from([(
+            cap.device_id.clone(),
+            Arc::new(RecordingDevice(tx, None)) as Arc<dyn RgbDevice>,
+        )]),
+        None,
+    )));
+    rgb.lock().set_openrgb_active(true);
+    rgb.lock().set_night_mode(true).unwrap();
+    let off = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(off.iter().all(|effect| effect.mode == RgbMode::Off));
+    let buffer = Arc::new(Mutex::new(DirectColorBuffer::new()));
+    let mut group = group();
+    group
+        .apply(&Command::Colors(vec![[1, 2, 3]; 6]), None, &buffer)
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer =
+        crate::controllers::rgb::start_direct_color_writer(rgb.clone(), buffer, stop.clone());
+    assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    rgb.lock().set_night_mode(false).unwrap();
+    let effects = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(effects.len(), 2);
+    assert!(effects.iter().all(|effect| effect.colors == [[1, 2, 3]; 3]));
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    rgb.lock().stop();
 }
 
 #[test]

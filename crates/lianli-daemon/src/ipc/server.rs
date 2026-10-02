@@ -97,6 +97,7 @@ pub fn build_info() -> lianli_shared::daemon::DaemonBuildInfo {
             "catalog_cleanup_review".into(),
             "catalog_cleanup_removal".into(),
             "managed_template_merge".into(),
+            "night_mode".into(),
         ],
     }
 }
@@ -535,6 +536,26 @@ fn handle_request(
                 }
             }
         }
+        IpcRequest::SetNightMode { enabled } => {
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+            if tx
+                .send(DaemonEvent::SetNightMode {
+                    enabled,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                    reply: reply_tx,
+                })
+                .is_err()
+            {
+                return IpcResponse::error("daemon service not running");
+            }
+            match reply_rx.recv_timeout(Duration::from_secs(4)) {
+                Ok(Ok(())) => IpcResponse::ok(serde_json::json!({ "accepted": true })),
+                Ok(Err(error)) => IpcResponse::error(error),
+                Err(error) => {
+                    IpcResponse::error(format!("Night Mode state change not confirmed: {error}"))
+                }
+            }
+        }
         IpcRequest::StartPixelClean {
             device_id,
             duration_minutes,
@@ -879,6 +900,59 @@ mod tests {
             }
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn night_mode_response_requires_service_acceptance_and_surfaces_failure() {
+        for result in [Ok(()), Err("lighting delivery failed".to_owned())] {
+            let root = tempfile::tempdir().unwrap();
+            let state = Arc::new(Mutex::new(DaemonState::new(
+                root.path().join("config.json"),
+            )));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let expected = result.clone();
+            let worker = thread::spawn(move || {
+                let DaemonEvent::SetNightMode {
+                    enabled,
+                    deadline,
+                    reply,
+                } = rx.recv().unwrap()
+                else {
+                    panic!("wrong event")
+                };
+                assert!(enabled);
+                assert!(deadline > Instant::now());
+                reply.send(result).unwrap();
+            });
+            let response = handle_request(
+                IpcRequest::SetNightMode { enabled: true },
+                &state,
+                tx.into(),
+            );
+            worker.join().unwrap();
+            match (expected, response) {
+                (Ok(()), IpcResponse::Ok { data }) => {
+                    assert_eq!(data, serde_json::json!({ "accepted": true }))
+                }
+                (Err(expected), IpcResponse::Error { message }) => assert_eq!(message, expected),
+                _ => panic!("wrong response"),
+            }
+            assert!(!root.path().join("config.json").exists());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new(
+            root.path().join("config.json"),
+        )));
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(rx);
+        assert!(matches!(
+            handle_request(
+                IpcRequest::SetNightMode { enabled: true },
+                &state,
+                tx.into()
+            ),
+            IpcResponse::Error { .. }
+        ));
     }
 
     #[test]

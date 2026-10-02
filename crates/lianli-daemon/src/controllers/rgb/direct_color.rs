@@ -148,11 +148,16 @@ pub fn start_direct_color_writer(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         debug!("Direct color writer started");
+        let output_gate = rgb.lock().output_override.clone();
         let mut failed_zones = std::collections::HashSet::<(String, u8)>::new();
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
+            }
+            if output_gate.read().is_some() {
+                thread::sleep(Duration::from_millis(16));
+                continue;
             }
 
             let updates = buffer.lock().take_all();
@@ -163,7 +168,9 @@ pub fn start_direct_color_writer(
                 }
                 let prepared = rgb.lock().prepare_group_write(&write.id, &write.effects);
                 let result = prepared.and_then(|device| {
-                    device.set_group_effects(&write.effects)?;
+                    super::output_override::with_normal_output(&output_gate, || {
+                        device.set_group_effects(&write.effects)
+                    })?;
                     rgb.lock().cache_group_effects(
                         write.id.clone(),
                         &device,
@@ -225,7 +232,11 @@ pub fn start_direct_color_writer(
                             break;
                         }
                         let key = (device_id.clone(), zone);
-                        match dev.set_direct_colors(zone, &colors) {
+                        let result =
+                            super::output_override::with_normal_output(&output_gate, || {
+                                dev.set_direct_colors(zone, &colors)
+                            });
+                        match result {
                             Ok(()) => {
                                 rgb.lock().cache_direct_zone(&device_id, &dev, zone, colors);
                                 if failed_zones.remove(&key) {

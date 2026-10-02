@@ -7,10 +7,7 @@ impl RgbController {
         effects: &[RgbEffect],
     ) -> anyhow::Result<Arc<dyn RgbDevice>> {
         self.ensure_individual_control(id)?;
-        anyhow::ensure!(
-            self.is_openrgb_controlled() || !self.thermal_override_active(),
-            "thermal alert currently controls RGB"
-        );
+        self.ensure_thermal_control_allowed()?;
         let device = self
             .wired
             .get(id)
@@ -61,10 +58,7 @@ impl RgbController {
 
     pub fn set_effect(&mut self, id: &str, zone: u8, effect: &RgbEffect) -> anyhow::Result<()> {
         self.ensure_individual_control(id)?;
-        anyhow::ensure!(
-            self.is_openrgb_controlled() || !self.thermal_override_active(),
-            "thermal alert currently controls RGB"
-        );
+        self.ensure_thermal_control_allowed()?;
         if self.software_controlled(id) {
             let mut state = self.render_state(id)?;
             if let Some(profile) = self
@@ -136,10 +130,7 @@ impl RgbController {
         colors: &[[u8; 3]],
     ) -> anyhow::Result<()> {
         self.ensure_individual_control(id)?;
-        anyhow::ensure!(
-            self.is_openrgb_controlled() || !self.thermal_override_active(),
-            "thermal alert currently controls RGB"
-        );
+        self.ensure_thermal_control_allowed()?;
         if self.software_controlled(id) {
             let mut state = self.render_state(id)?;
             state.set_direct(zone, colors)?;
@@ -176,12 +167,10 @@ impl RgbController {
         Ok(())
     }
 
-    pub fn resync_wireless_direct_colors(&mut self) {
-        self.resync_wireless_effects();
-    }
-
     pub fn resync_wireless_effects(&mut self) {
-        if self.config.as_ref().is_some_and(|config| !config.enabled) {
+        if !self.output_override_active()
+            && self.config.as_ref().is_some_and(|config| !config.enabled)
+        {
             return;
         }
         if let Some(wireless) = &self.wireless {
@@ -219,10 +208,7 @@ impl RgbController {
         interval_ms: u16,
     ) -> anyhow::Result<()> {
         self.ensure_individual_control(id)?;
-        anyhow::ensure!(
-            self.is_openrgb_controlled() || !self.thermal_override_active(),
-            "thermal alert currently controls RGB"
-        );
+        self.ensure_thermal_control_allowed()?;
         anyhow::ensure!(
             self.software_controlled(id),
             "device {id} does not support software RGB"
@@ -267,11 +253,14 @@ impl RgbController {
     pub fn set_mb_rgb_sync(&mut self, id: &str, enabled: bool) -> anyhow::Result<()> {
         if enabled {
             self.ensure_individual_control(id)?;
+            self.ensure_thermal_control_allowed()?;
+        } else {
+            self.ensure_night_mode_inactive()?;
         }
-        anyhow::ensure!(
-            !enabled || self.is_openrgb_controlled() || !self.thermal_override_active(),
-            "thermal alert currently controls RGB"
-        );
+        self.apply_mb_rgb_sync(id, enabled)
+    }
+
+    pub(super) fn apply_mb_rgb_sync(&mut self, id: &str, enabled: bool) -> anyhow::Result<()> {
         if self.mb_sync_state.get(id) == Some(&enabled) {
             return Ok(());
         }

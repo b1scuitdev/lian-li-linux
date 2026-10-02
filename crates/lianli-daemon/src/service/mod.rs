@@ -23,6 +23,7 @@ mod lcd_group_recovery;
 mod lifecycle_monitor;
 mod media;
 mod media_preparation;
+mod night_mode;
 mod open_workers;
 mod pixel_cleaner;
 mod renderers;
@@ -70,6 +71,7 @@ fn event_label(event: &DaemonEvent) -> &'static str {
         DaemonEvent::RebootWirelessLcd { .. } => "RebootWirelessLcd",
         DaemonEvent::DisableLc217Wifi { .. } => "DisableLc217Wifi",
         DaemonEvent::SetLcdBrightness { .. } => "SetLcdBrightness",
+        DaemonEvent::SetNightMode { .. } => "SetNightMode",
         DaemonEvent::StartPixelClean { .. } => "StartPixelClean",
         DaemonEvent::UploadStartupImage { .. } => "UploadStartupImage",
         DaemonEvent::StopPixelClean { .. } => "StopPixelClean",
@@ -213,6 +215,11 @@ pub enum DaemonEvent {
         deadline: Instant,
         reply: std::sync::mpsc::SyncSender<Result<bool, String>>,
     },
+    SetNightMode {
+        enabled: bool,
+        deadline: Instant,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
     StartPixelClean {
         device_id: Option<String>,
         duration_minutes: u16,
@@ -234,6 +241,7 @@ pub struct ServiceManager {
     config_path: PathBuf,
     socket_path: PathBuf,
     config: Option<AppConfig>,
+    night_mode_active: bool,
     media_assets: HashMap<usize, Arc<lianli_media::MediaAsset>>,
     media_settings: HashMap<usize, lianli_shared::config::LcdConfig>,
     media_requested_keys: Vec<lianli_shared::config::ConfigKey>,
@@ -308,6 +316,7 @@ impl ServiceManager {
             config_path,
             socket_path,
             config: None,
+            night_mode_active: false,
             media_assets: HashMap::new(),
             media_settings: HashMap::new(),
             media_requested_keys: Vec::new(),
@@ -932,20 +941,7 @@ impl ServiceManager {
                 }
                 DaemonEvent::ResyncWirelessRgb => {
                     if let Some(ref rgb) = self.controllers.rgb {
-                        let mut rgb = rgb.lock();
-                        if rgb.is_openrgb_controlled() {
-                            debug!(
-                                "OpenRGB server active — resyncing last direct-color frame instead of native effect"
-                            );
-                            rgb.resync_wireless_direct_colors();
-                        } else if rgb.thermal_override_active() {
-                            // The drift checker sees the thermal override as
-                            // drift from the configured effect. Do not let
-                            // the resync fight the alert coloring.
-                            debug!("Thermal override active — skipping RGB resync");
-                        } else {
-                            rgb.resync_wireless_effects();
-                        }
+                        rgb.lock().resync_wireless_effects();
                     }
                 }
                 DaemonEvent::MediaPlaybackStopped {
@@ -1004,6 +1000,8 @@ impl ServiceManager {
                                 target.device_identity
                             );
                             target.swap_media(asset, target.custom_h264, self.tx.clone());
+                            target
+                                .reapply_brightness(Some(&self.wireless), &mut self.packet_builder);
                         }
                     }
                 }
@@ -1088,6 +1086,18 @@ impl ServiceManager {
                     };
                     let _ = reply.try_send(result);
                 }
+                DaemonEvent::SetNightMode {
+                    enabled,
+                    deadline,
+                    reply,
+                } => {
+                    let result = if Instant::now() >= deadline {
+                        Err("Night Mode request expired".into())
+                    } else {
+                        self.set_night_mode(enabled)
+                    };
+                    let _ = reply.try_send(result);
+                }
                 DaemonEvent::StartPixelClean {
                     device_id,
                     duration_minutes,
@@ -1125,6 +1135,7 @@ impl ServiceManager {
                         rgb.lock().invalidate_hardware_state();
                     }
                     self.rebuild_rgb_controller();
+                    self.reapply_lcd_brightness();
                     self.restart_fan_control();
                     self.start_aio_control();
                     self.sync_ipc_state();
