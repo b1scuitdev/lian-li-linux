@@ -1267,7 +1267,12 @@ impl ActiveTarget {
         builder: &mut PacketBuilder,
         enabled: bool,
     ) -> Result<(), String> {
-        if self.night_mode_active != enabled {
+        let retry_exhausted = self.pending_brightness.is_none()
+            && self
+                .brightness_status
+                .as_ref()
+                .is_some_and(|status| status.error.is_some());
+        if self.night_mode_active != enabled || retry_exhausted {
             self.night_mode_active = enabled;
             self.reapply_brightness(wireless, builder);
         }
@@ -3205,7 +3210,7 @@ mod tests {
 
     struct TestLcd {
         brightness: Arc<AtomicUsize>,
-        brightness_failures: AtomicUsize,
+        brightness_failures: Arc<AtomicUsize>,
         sends: Arc<AtomicUsize>,
         fail_on: usize,
         fail_count: usize,
@@ -3255,10 +3260,16 @@ mod tests {
     fn brightness_target_with_failures(
         failures: usize,
     ) -> (ActiveTarget, SharedHidLcd, Arc<AtomicUsize>) {
+        brightness_target_with_failure_state(Arc::new(AtomicUsize::new(failures)))
+    }
+
+    fn brightness_target_with_failure_state(
+        failures: Arc<AtomicUsize>,
+    ) -> (ActiveTarget, SharedHidLcd, Arc<AtomicUsize>) {
         let brightness = Arc::new(AtomicUsize::new(80));
         let device = Arc::new(HidLcd::new(Box::new(TestLcd {
             brightness: brightness.clone(),
-            brightness_failures: AtomicUsize::new(failures),
+            brightness_failures: failures,
             sends: Arc::new(AtomicUsize::new(0)),
             fail_on: 0,
             fail_count: 0,
@@ -3364,6 +3375,55 @@ mod tests {
         target.next_brightness_attempt = None;
         target.set_night_mode(None, &mut builder, false).unwrap();
         assert_eq!(brightness.load(Ordering::Relaxed), 57);
+    }
+
+    #[test]
+    fn repeated_night_mode_requests_retry_exhausted_brightness_delivery() {
+        for enabled in [true, false] {
+            let failures = Arc::new(AtomicUsize::new(0));
+            let (mut target, _, brightness) =
+                brightness_target_with_failure_state(failures.clone());
+            let mut builder = PacketBuilder::new();
+            target.apply_config_brightness(None, &mut builder, 37);
+            if !enabled {
+                target.next_brightness_attempt = None;
+                target.set_night_mode(None, &mut builder, true).unwrap();
+                assert_eq!(brightness.load(Ordering::Relaxed), 0);
+            }
+            failures.store(3, Ordering::Relaxed);
+            target.next_brightness_attempt = None;
+            assert!(target.set_night_mode(None, &mut builder, enabled).is_err());
+            target.next_brightness_attempt = None;
+            assert!(target.set_night_mode(None, &mut builder, enabled).is_err());
+            assert_eq!(failures.load(Ordering::Relaxed), 2);
+            for _ in 0..2 {
+                target.next_brightness_attempt = None;
+                target.flush_pending_brightness(None, &mut builder);
+            }
+            let status = target.brightness_status().unwrap();
+            assert!(!status.pending);
+            assert!(status.error.is_some());
+            target.next_brightness_attempt = None;
+            target.flush_pending_brightness(None, &mut builder);
+            assert!(target.brightness_status().unwrap().error.is_some());
+            assert_eq!(
+                brightness.load(Ordering::Relaxed),
+                if enabled { 37 } else { 0 }
+            );
+            failures.store(0, Ordering::Relaxed);
+            target.set_night_mode(None, &mut builder, enabled).unwrap();
+            assert_eq!(
+                brightness.load(Ordering::Relaxed),
+                if enabled { 0 } else { 37 }
+            );
+            assert!(target.brightness_status().unwrap().error.is_none());
+            assert!(!target.brightness_status().unwrap().pending);
+            failures.store(1, Ordering::Relaxed);
+            target.next_brightness_attempt = None;
+            target.set_night_mode(None, &mut builder, enabled).unwrap();
+            assert_eq!(failures.load(Ordering::Relaxed), 1);
+            assert!(!target.brightness_status().unwrap().pending);
+        }
     }
 
     #[test]
@@ -3524,7 +3584,7 @@ mod tests {
         let brightness = Arc::new(AtomicUsize::new(75));
         let device = Arc::new(HidLcd::new(Box::new(TestLcd {
             brightness: brightness.clone(),
-            brightness_failures: AtomicUsize::new(0),
+            brightness_failures: Arc::new(AtomicUsize::new(0)),
             sends: Arc::new(AtomicUsize::new(0)),
             fail_on: 0,
             fail_count: 0,
@@ -3686,7 +3746,7 @@ mod tests {
         (
             Arc::new(HidLcd::new(Box::new(TestLcd {
                 brightness: Arc::new(AtomicUsize::new(100)),
-                brightness_failures: AtomicUsize::new(0),
+                brightness_failures: Arc::new(AtomicUsize::new(0)),
                 sends: Arc::clone(&sends),
                 fail_on,
                 fail_count,
@@ -3701,7 +3761,7 @@ mod tests {
             let brightness = Arc::new(AtomicUsize::new(75));
             let device = Arc::new(HidLcd::new(Box::new(TestLcd {
                 brightness: brightness.clone(),
-                brightness_failures: AtomicUsize::new(0),
+                brightness_failures: Arc::new(AtomicUsize::new(0)),
                 sends: Arc::new(AtomicUsize::new(0)),
                 fail_on: 0,
                 fail_count: 0,

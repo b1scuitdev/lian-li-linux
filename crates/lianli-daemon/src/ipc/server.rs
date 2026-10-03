@@ -399,10 +399,15 @@ fn handle_request(
             if let Some(error) = super::fan::validate_quantities(&config, &state.lock().devices) {
                 return IpcResponse::error(error);
             }
-            if let Some(rgb_config) = &config.rgb {
-                if let Some(response) = super::rgb::validate_saved_config(state, rgb_config) {
-                    return response;
-                }
+            let disabled_rgb = lianli_shared::rgb::RgbAppConfig {
+                enabled: false,
+                ..Default::default()
+            };
+            if let Some(response) = super::rgb::validate_saved_config(
+                state,
+                config.rgb.as_ref().unwrap_or(&disabled_rgb),
+            ) {
+                return response;
             }
             let mut state = state.lock();
             if let Some(error) =
@@ -1001,6 +1006,100 @@ mod tests {
             ),
             IpcResponse::Error { .. }
         ));
+    }
+
+    #[test]
+    fn removing_rgb_config_requires_releasing_native_night_mode_before_persistence() {
+        use lianli_devices::traits::RgbDevice;
+        use lianli_shared::rgb::{RgbAppConfig, RgbEffect, RgbMode, RgbZoneInfo};
+
+        struct NativeRgb;
+        impl RgbDevice for NativeRgb {
+            fn device_name(&self) -> String {
+                "Native RGB".into()
+            }
+            fn supported_modes(&self) -> Vec<RgbMode> {
+                vec![RgbMode::Off, RgbMode::Static]
+            }
+            fn zone_info(&self) -> Vec<RgbZoneInfo> {
+                vec![RgbZoneInfo {
+                    name: "Lighting".into(),
+                    led_count: 1,
+                }]
+            }
+            fn set_zone_effect(&self, _: u8, _: &RgbEffect) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.json");
+        let mut controller = RgbController::new(
+            std::collections::HashMap::from([(
+                "native".into(),
+                Arc::new(NativeRgb) as Arc<dyn RgbDevice>,
+            )]),
+            None,
+        );
+        let rgb: RgbAppConfig = serde_json::from_value(serde_json::json!({
+            "devices": [{"device_id": "native", "zones": [{"zone_index": 0, "effect": {"mode": "Static"}}]}]
+        }))
+        .unwrap();
+        controller.apply_config(&rgb, &[]);
+        controller.set_night_mode(true).unwrap();
+        let controller = Arc::new(Mutex::new(controller));
+        let saved = AppConfig {
+            rgb: Some(rgb.clone()),
+            ..Default::default()
+        };
+        let mut daemon = DaemonState::new(path.clone());
+        daemon.config = Some(saved.clone());
+        daemon.rgb_controller = Some(controller.clone());
+        let state = Arc::new(Mutex::new(daemon));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for config in [
+            AppConfig {
+                rgb: None,
+                ..saved.clone()
+            },
+            AppConfig {
+                rgb: Some(RgbAppConfig {
+                    enabled: false,
+                    ..rgb.clone()
+                }),
+                ..saved.clone()
+            },
+        ] {
+            let IpcResponse::Error { message } = handle_request(
+                IpcRequest::SetConfig {
+                    config: Box::new(config),
+                },
+                &state,
+                tx.clone().into(),
+            ) else {
+                panic!("destructive RGB config change succeeded")
+            };
+            assert!(message.contains("Disable Night Mode"));
+            assert_eq!(
+                serde_json::to_value(&state.lock().config).unwrap(),
+                serde_json::to_value(Some(&saved)).unwrap()
+            );
+            assert!(!path.exists());
+            assert!(rx.try_recv().is_err());
+        }
+        controller.lock().set_night_mode(false).unwrap();
+        assert!(matches!(
+            handle_request(
+                IpcRequest::SetConfig {
+                    config: Box::new(AppConfig { rgb: None, ..saved }),
+                },
+                &state,
+                tx.into(),
+            ),
+            IpcResponse::Ok { .. }
+        ));
+        assert!(state.lock().config.as_ref().unwrap().rgb.is_none());
+        assert!(path.is_file());
     }
 
     #[test]

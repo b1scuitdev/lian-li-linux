@@ -351,7 +351,11 @@ fn run_server(
 
                 let prev = count.fetch_add(1, Ordering::Relaxed);
                 if prev == 0 {
-                    rgb.lock().set_openrgb_active(true);
+                    if let Err(error) = rgb.lock().set_openrgb_active(true) {
+                        count.fetch_sub(1, Ordering::Relaxed);
+                        warn!(%error, "OpenRGB ownership change rejected");
+                        continue;
+                    }
                 }
 
                 let client = thread::spawn(move || {
@@ -361,7 +365,9 @@ fn run_server(
 
                     let remaining = count.fetch_sub(1, Ordering::Relaxed) - 1;
                     if remaining == 0 {
-                        client.rgb.lock().set_openrgb_active(false);
+                        if let Err(error) = client.rgb.lock().set_openrgb_active(false) {
+                            warn!(%error, "Failed to release OpenRGB ownership");
+                        }
                     }
                     info!("OpenRGB client disconnected ({remaining} remaining)");
                 });
@@ -378,7 +384,7 @@ fn run_server(
     }
 
     drop(clients);
-    rgb.lock().set_openrgb_active(false);
+    rgb.lock().set_openrgb_active(false)?;
     info!("OpenRGB server stopped");
     Ok(())
 }

@@ -93,14 +93,59 @@ impl RgbController {
     }
 
     pub(super) fn prepare_sync(&self, config: &RgbAppConfig) -> Result<Vec<PreparedSync>> {
+        self.prepare_sync_output(config, false, None)
+    }
+
+    pub(super) fn prepare_sync_blackout(
+        &self,
+        config: &RgbAppConfig,
+        id: &str,
+    ) -> Result<Vec<PreparedSync>> {
+        self.prepare_sync_output(config, true, Some(id))
+    }
+
+    fn prepare_sync_output(
+        &self,
+        config: &RgbAppConfig,
+        blackout: bool,
+        only_device: Option<&str>,
+    ) -> Result<Vec<PreparedSync>> {
+        self.prepare_sync_with(
+            config,
+            blackout,
+            only_device,
+            |mac, animation, projected| {
+                let wireless = self
+                    .wireless
+                    .as_ref()
+                    .context("wireless RGB controller unavailable")?;
+                if projected {
+                    wireless.prepare_rgb_sync_animation(mac, &animation.frames, animation.timing())
+                } else {
+                    wireless.prepare_rgb_animation(mac, &animation.frames, animation.timing())
+                }
+            },
+        )
+    }
+
+    fn prepare_sync_with(
+        &self,
+        config: &RgbAppConfig,
+        blackout: bool,
+        only_device: Option<&str>,
+        prepare_upload: impl Fn(&[u8; 6], &Animation, bool) -> Result<WirelessRgbUpload>,
+    ) -> Result<Vec<PreparedSync>> {
         let Some(sync) = config.merge_lighting.as_ref().filter(|sync| sync.enabled) else {
             return Ok(Vec::new());
         };
         validate_settings(sync)?;
-        let ids = self.sync_ids(config);
+        let mut ids = self.sync_ids(config);
+        if let Some(id) = only_device {
+            ids.retain(|device| device == id);
+        }
         let native = sync.kind == RgbSyncKind::Matched
             || matches!(sync.effect.mode, RgbMode::RainbowMorph | RgbMode::Twinkle);
-        let strimer_reference = if native {
+        let strimer_reference = if native && !blackout {
             ids.iter()
                 .find_map(|id| {
                     self.regional_profile(id).filter(|profile| {
@@ -129,14 +174,26 @@ impl RgbController {
             total <= 720,
             "continuous RGB sync supports at most 720 logical LEDs"
         );
-        let generic = (!native && !ids.is_empty())
+        let generic = (!blackout && !native && !ids.is_empty())
             .then(|| sync_effects::render(&sync.effect, total.max(24)))
             .transpose()?;
         let mut offset = 0;
         let mut prepared = Vec::with_capacity(ids.len());
         for (index, id) in ids.into_iter().enumerate() {
             let projected = !native;
-            let mut animation = if let Some(generic) = &generic {
+            let profile = self.regional_profile(&id);
+            let mut animation = if blackout && (projected || profile.is_some()) {
+                let led_count = if projected {
+                    layouts[index].physical_led_count()
+                } else {
+                    self.render_state(&id)?.colors.len()
+                };
+                Animation {
+                    frames: vec![vec![[0; 3]; led_count]],
+                    interval_hundredths: FRAME_INTERVAL_MS as u32 * 160,
+                    secondary: None,
+                }
+            } else if let Some(generic) = &generic {
                 let layout = &layouts[index];
                 let end = offset + layout.logical_led_count();
                 let reverse = sync
@@ -156,7 +213,7 @@ impl RgbController {
                     interval_hundredths: generic.interval_hundredths,
                     secondary: None,
                 }
-            } else if let Some(profile) = self.regional_profile(&id) {
+            } else if let Some(profile) = profile {
                 native_animation(profile, &sync.effect)
                     .with_context(|| format!("sync effect is unsupported by {id}"))?
             } else {
@@ -173,14 +230,25 @@ impl RgbController {
                     device.supported_modes().contains(&sync.effect.mode),
                     "sync effect is unsupported by {id}"
                 );
-                prepared.push(PreparedSync::Hardware {
-                    id,
-                    device,
-                    effect: sync.effect.clone(),
-                });
+                let effect = if blackout {
+                    RgbEffect {
+                        mode: if device.supported_modes().contains(&RgbMode::Off) {
+                            RgbMode::Off
+                        } else {
+                            sync.effect.mode
+                        },
+                        colors: vec![[0; 3]],
+                        brightness: lianli_shared::rgb::BRIGHTNESS_OFF,
+                        disabled: true,
+                        ..sync.effect.clone()
+                    }
+                } else {
+                    sync.effect.clone()
+                };
+                prepared.push(PreparedSync::Hardware { id, device, effect });
                 continue;
             };
-            if native && self.is_short_strimer(&id) {
+            if native && !blackout && self.is_short_strimer(&id) {
                 if let Some(reference) = &strimer_reference {
                     animation.interval_hundredths = super::strimer_sync::matched_interval(
                         reference.interval_hundredths,
@@ -195,23 +263,7 @@ impl RgbController {
                 "RGB sync animation exceeds the playback frame capacity for {id}"
             );
             if let Some(wireless_device) = self.wireless_state.get(&id) {
-                let wireless = self
-                    .wireless
-                    .as_ref()
-                    .context("wireless RGB controller unavailable")?;
-                let upload = if projected {
-                    wireless.prepare_rgb_sync_animation(
-                        &wireless_device.mac,
-                        &animation.frames,
-                        animation.timing(),
-                    )?
-                } else {
-                    wireless.prepare_rgb_animation(
-                        &wireless_device.mac,
-                        &animation.frames,
-                        animation.timing(),
-                    )?
-                };
+                let upload = prepare_upload(&wireless_device.mac, &animation, projected)?;
                 prepared.push(PreparedSync::Wireless {
                     id,
                     mac: wireless_device.mac,

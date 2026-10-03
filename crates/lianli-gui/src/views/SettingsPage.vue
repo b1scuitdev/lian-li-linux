@@ -152,7 +152,7 @@ function onHidBackend(v: "hidraw" | "rusb") {
           @update:value="setNightMode"
         />
       </div>
-      <p class="hint">Temporarily turns off supported LCD backlights and RGB lighting. Fan and pump control are unaffected. Night Mode takes priority over thermal alert lighting.</p>
+      <p class="hint">Temporarily turns off supported LCD backlights and native RGB lighting. Fan and pump control are unaffected. RGB remains under OpenRGB or motherboard control when those modes are enabled.</p>
       <n-alert v-if="nightModeError" type="error">{{ nightModeError }}</n-alert>
       <div class="kv"><span class="muted">HID Backend</span>
         <n-select

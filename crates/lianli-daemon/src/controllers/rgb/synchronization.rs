@@ -81,7 +81,7 @@ impl RgbController {
         Ok(())
     }
 
-    fn submit_sync(&mut self, item: PreparedSync) -> Result<()> {
+    pub(super) fn submit_sync(&mut self, item: PreparedSync) -> Result<()> {
         match item {
             PreparedSync::Wired {
                 id,

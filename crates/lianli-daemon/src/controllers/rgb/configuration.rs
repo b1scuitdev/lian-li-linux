@@ -7,6 +7,99 @@ struct ConfiguredRender {
 }
 
 impl RgbController {
+    pub(super) fn native_night_mode_eligible(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| self.night_mode_config_eligible(config, &self.presets))
+    }
+
+    fn night_mode_config_eligible(&self, config: &RgbAppConfig, presets: &[RgbPreset]) -> bool {
+        if !config.enabled || config.openrgb_server {
+            return false;
+        }
+        if config.devices.iter().any(|device| device.mb_rgb_sync)
+            || self.mb_sync_state.values().any(|enabled| *enabled)
+        {
+            return false;
+        }
+        let sync_ids = self.sync_ids(config);
+        let caps: Vec<_> = self
+            .exposed_capabilities()
+            .into_iter()
+            .filter(|cap| cap.total_led_count > 0)
+            .collect();
+        !caps.is_empty()
+            && caps.iter().all(|cap| {
+                if sync_ids.contains(&cap.device_id) {
+                    return self.output_override_active()
+                        || self.sync_active.contains(&cap.device_id);
+                }
+                let Some(device) = config
+                    .devices
+                    .iter()
+                    .find(|device| device.device_id == cap.device_id)
+                else {
+                    return false;
+                };
+                if cap.zones.is_empty()
+                    || !(self.software_controlled(&cap.device_id)
+                        || cap.supported_modes.contains(&RgbMode::Off)
+                        || cap.supports_direct)
+                    || (!self.output_override_active()
+                        && !self.configured.contains_key(&cap.device_id)
+                        && !self.sync_active.contains(&cap.device_id))
+                {
+                    return false;
+                }
+                if self.software_controlled(&cap.device_id) {
+                    let Ok(render) = self.configured_render(device, presets) else {
+                        return false;
+                    };
+                    if render.state.regions.is_some() {
+                        return true;
+                    }
+                    if let Some(name) = &device.active_preset {
+                        return presets
+                            .iter()
+                            .find(|preset| {
+                                &preset.name == name && preset.device_id == cap.device_id
+                            })
+                            .is_some_and(|preset| {
+                                (0..cap.zones.len()).all(|zone| {
+                                    preset.zones.iter().any(|entry| {
+                                        usize::from(entry.zone) == zone
+                                            && (!entry.colors.is_empty()
+                                                || entry.effect.as_ref().is_some_and(|effect| {
+                                                    effect.mode != RgbMode::Direct
+                                                        || !effect.colors.is_empty()
+                                                }))
+                                    })
+                                })
+                            });
+                    }
+                }
+                let Ok(groups) = self.configured_group_effects(device, presets) else {
+                    return false;
+                };
+                if let Some(groups) = groups.filter(|groups| !groups.is_empty()) {
+                    return groups
+                        .iter()
+                        .any(|effect| effect.scope == lianli_shared::rgb::RgbScope::All);
+                }
+                if device.active_preset.is_some() || device.regions.is_some() {
+                    return false;
+                }
+                (0..cap.zones.len()).all(|zone| {
+                    device.zones.iter().any(|entry| {
+                        usize::from(entry.zone_index) == zone
+                            && cap.supported_modes.contains(&entry.effect.mode)
+                            && (entry.effect.mode != RgbMode::Direct
+                                || !entry.effect.colors.is_empty())
+                    })
+                })
+            })
+    }
+
     fn validate_fan_led_counts(&self, config: &RgbAppConfig) -> anyhow::Result<()> {
         for saved in &config.devices {
             if let Some(device) = self.wired.get(&saved.device_id) {
@@ -27,21 +120,36 @@ impl RgbController {
     }
 
     pub fn validate_config(&self, config: &RgbAppConfig) -> anyhow::Result<()> {
+        self.validate_config_with_presets(config, &self.presets)
+    }
+
+    fn validate_config_with_presets(
+        &self,
+        config: &RgbAppConfig,
+        presets: &[RgbPreset],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.native_night_mode_engaged() || self.night_mode_config_eligible(config, presets),
+            "Disable Night Mode before changing RGB ownership or removing its configured output"
+        );
         lianli_shared::rgb::validate_effect_memory(config).map_err(anyhow::Error::msg)?;
         self.validate_fan_led_counts(config)?;
         if !config.enabled || config.openrgb_server {
             return Ok(());
         }
         self.prepare_sync(config)?;
-        let presets = self.presets.clone();
+        let sync_ids = self.sync_ids(config);
         for device in &config.devices {
+            if sync_ids.contains(&device.device_id) {
+                continue;
+            }
             if !device.mb_rgb_sync {
-                self.configured_group_effects(device, &presets)?;
+                self.configured_group_effects(device, presets)?;
             }
             if device.mb_rgb_sync || !self.software_controlled(&device.device_id) {
                 continue;
             }
-            let state = self.configured_render(device, &presets)?.state;
+            let state = self.configured_render(device, presets)?.state;
             if let Some(profile) = self.regional_profile(&device.device_id) {
                 if let Some(regions) = &state.regions {
                     let animation = lianli_media::rgb::family::render(profile, regions)?;
@@ -76,10 +184,50 @@ impl RgbController {
     }
 
     pub fn apply_config(&mut self, config: &RgbAppConfig, presets: &[RgbPreset]) {
-        if let Err(error) = self.validate_fan_led_counts(config) {
+        if self.native_night_mode_engaged() {
+            if let Err(error) = self.validate_config_with_presets(config, presets) {
+                warn!("Failed to apply RGB config: {error:#}");
+                return;
+            }
+            self.config = Some(config.clone());
+            self.presets = presets.to_vec();
+            if let Err(error) = self.refresh_output_override(true) {
+                warn!("RGB override failed: {error:#}");
+            }
+            return;
+        }
+        if let Err(error) = self.release_native_night_mode() {
+            warn!("Failed to release RGB Night Mode before config reload: {error:#}");
+            return;
+        }
+        if let Err(error) = self.configure_fan_led_counts(config) {
             warn!("Invalid fan LED counts: {error}");
             return;
         }
+        let previous = self.config.replace(config.clone());
+        self.presets = presets.to_vec();
+        self.openrgb_server_enabled = config.openrgb_server;
+        match self.refresh_output_override(true) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                warn!("RGB override failed: {error:#}");
+                return;
+            }
+        }
+        if let Err(error) = self.apply_config_output(config, presets, previous.as_ref()) {
+            warn!("Failed to apply RGB config: {error:#}");
+            return;
+        }
+        if self.night_mode_active {
+            if let Err(error) = self.refresh_output_override(true) {
+                warn!("RGB override failed: {error:#}");
+            }
+        }
+    }
+
+    pub(super) fn configure_fan_led_counts(&mut self, config: &RgbAppConfig) -> anyhow::Result<()> {
+        self.validate_fan_led_counts(config)?;
         for (id, device) in &self.wired {
             if device.fan_led_count_control().is_none() {
                 continue;
@@ -98,26 +246,10 @@ impl RgbController {
                     self.sync_signature = None;
                 }
                 Ok(false) => {}
-                Err(error) => {
-                    warn!("Invalid fan LED count for {id}: {error}");
-                    return;
-                }
+                Err(error) => return Err(error).with_context(|| format!("Fan LED count for {id}")),
             }
         }
-        let previous = self.config.replace(config.clone());
-        self.presets = presets.to_vec();
-        self.openrgb_server_enabled = config.openrgb_server;
-        match self.refresh_output_override(true) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                warn!("RGB override failed: {error:#}");
-                return;
-            }
-        }
-        if let Err(error) = self.apply_config_output(config, presets, previous.as_ref()) {
-            warn!("Failed to apply RGB config: {error:#}");
-        }
+        Ok(())
     }
 
     pub(super) fn apply_config_output(
@@ -153,7 +285,15 @@ impl RgbController {
         let mut ordered: Vec<_> = config.devices.iter().collect();
         ordered.sort_by_key(|device| self.is_short_strimer(&device.device_id));
         for device in ordered {
-            if self.sync_active.contains(&device.device_id) {
+            if self.sync_active.contains(&device.device_id)
+                || config.merge_lighting.as_ref().is_some_and(|sync| {
+                    sync.enabled
+                        && sync.device_order.contains(&device.device_id)
+                        && !sync.disabled_devices.contains(&device.device_id)
+                        && !self.wired.contains_key(&device.device_id)
+                        && !self.wireless_state.contains_key(&device.device_id)
+                })
+            {
                 continue;
             }
             let result = (|| -> anyhow::Result<()> {

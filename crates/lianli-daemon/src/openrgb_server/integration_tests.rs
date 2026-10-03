@@ -240,7 +240,7 @@ fn ordinary_device_colours_are_replayed_after_hardware_invalidation() {
 }
 
 #[test]
-fn night_mode_release_replays_openrgb_session_without_disconnecting_the_client() {
+fn night_mode_bypass_preserves_openrgb_session_without_replay() {
     let server = Server::new(false);
     let mut client = server.connect(6);
     let colors = vec![[9, 8, 7]; 4];
@@ -256,21 +256,29 @@ fn night_mode_release_replays_openrgb_session_without_disconnecting_the_client()
     let thermal = crate::thermal_alert::new_shared();
     *thermal.lock() = Some([255, 128, 0]);
     server.rgb.lock().set_thermal_override(thermal);
+    let generation = server.rgb.lock().output_resume_generation();
     server.rgb.lock().set_night_mode(true).unwrap();
+    assert!(!server.rgb.lock().output_override_active());
+    let latest = vec![[1, 2, 3]; 4];
+    let mut payload = Vec::new();
+    protocol::write_colors(&mut payload, &latest);
+    send(
+        &mut client,
+        PKT_UPDATE_LEDS,
+        &protocol::sized_packet(&payload),
+    );
+    assert_colors(&notification(&mut client), &latest);
+    let zones = server
+        .buffer
+        .lock()
+        .take_all()
+        .remove("hid:0416:7395:test")
+        .unwrap();
+    assert_eq!(zones[&0], [[1, 2, 3]; 2]);
+    assert_eq!(zones[&1], [[1, 2, 3]; 2]);
     server.rgb.lock().set_night_mode(false).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Some(zones) = server.buffer.lock().take_all().get("hid:0416:7395:test") {
-            assert_eq!(zones[&0], [[9, 8, 7]; 2]);
-            assert_eq!(zones[&1], [[9, 8, 7]; 2]);
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "No OpenRGB replay after Night Mode"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+    assert_eq!(server.rgb.lock().output_resume_generation(), generation);
+    assert!(server.buffer.lock().take_all().is_empty());
     send(&mut client, PKT_REQUEST_CONTROLLER_COUNT, &[]);
     assert_eq!(
         read_packet_from(&mut client).unwrap().1,

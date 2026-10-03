@@ -74,7 +74,7 @@ fn openrgb_ownership_cannot_resubmit_the_previous_native_loop() {
         "wireless:old".into(),
         Arc::new(WirelessRgbUpload::new(&[vec![[255, 0, 0]; 26]], 50, None).unwrap()),
     );
-    controller.set_openrgb_active(true);
+    controller.set_openrgb_active(true).unwrap();
     assert!(controller.uploads.is_empty());
     assert!(controller.is_openrgb_controlled());
 }

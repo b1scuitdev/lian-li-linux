@@ -182,6 +182,333 @@ fn setup() -> (RgbController, RgbAppConfig, mpsc::Receiver<Vec<[u8; 3]>>) {
     (controller, config, received)
 }
 
+struct BlockingSync {
+    frames: mpsc::Sender<Vec<[u8; 3]>>,
+    entered: mpsc::Sender<()>,
+    release: parking_lot::Mutex<mpsc::Receiver<()>>,
+    block: std::sync::atomic::AtomicBool,
+}
+
+impl RgbDevice for BlockingSync {
+    fn device_name(&self) -> String {
+        "Sync output".into()
+    }
+    fn supported_modes(&self) -> Vec<RgbMode> {
+        vec![RgbMode::Static]
+    }
+    fn zone_info(&self) -> Vec<RgbZoneInfo> {
+        vec![RgbZoneInfo {
+            name: "Lighting".into(),
+            led_count: 9,
+        }]
+    }
+    fn software_render_profile(&self) -> Option<RgbRenderProfile> {
+        Some(RgbRenderProfile {
+            family: RgbRenderFamily::P28,
+            fan_count: 1,
+            led_count: 9,
+            right_attach: false,
+        })
+    }
+    fn software_frame_delivery(&self) -> Option<RgbFrameDelivery> {
+        Some(RgbFrameDelivery::Streaming)
+    }
+    fn set_zone_effect(&self, _: u8, _: &RgbEffect) -> anyhow::Result<()> {
+        anyhow::bail!("sync output required")
+    }
+    fn set_software_frames(&self, _: &[Vec<[u8; 3]>], _: u16) -> anyhow::Result<()> {
+        anyhow::bail!("sync output required")
+    }
+    fn set_sync_animation(
+        &self,
+        frames: &[Vec<[u8; 3]>],
+        _: lianli_shared::rgb::RgbPlaybackTiming,
+    ) -> anyhow::Result<()> {
+        if frames[0].iter().any(|color| *color != [0; 3])
+            && self.block.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.entered.send(())?;
+            self.release.lock().recv_timeout(Duration::from_secs(2))?;
+        }
+        self.frames.send(frames[0].clone())?;
+        Ok(())
+    }
+}
+
+#[test]
+fn continuous_merge_black_follows_inflight_output_and_resumes_current_config() {
+    let (frames, received) = mpsc::channel();
+    let (entered, waiting) = mpsc::channel();
+    let (release, blocked) = mpsc::channel();
+    let (mut controller, mut config, other) = setup();
+    let screen = controller.clone_wired_device("screen").unwrap();
+    controller.replace_wired(HashMap::from([
+        ("screen".into(), screen),
+        (
+            "sync".into(),
+            Arc::new(BlockingSync {
+                frames,
+                entered,
+                release: parking_lot::Mutex::new(blocked),
+                block: std::sync::atomic::AtomicBool::new(true),
+            }) as Arc<dyn RgbDevice>,
+        ),
+    ]));
+    config.devices.clear();
+    config.devices.push(RgbDeviceConfig {
+        device_id: "offline".into(),
+        fan_led_count: None,
+        mb_rgb_sync: false,
+        active_preset: None,
+        regions: None,
+        effect_memory: Vec::new(),
+        zones: vec![RgbZoneConfig {
+            zone_index: 0,
+            effect: RgbEffect::default(),
+            swap_lr: false,
+            swap_tb: false,
+        }],
+    });
+    let sync = config.merge_lighting.as_mut().unwrap();
+    sync.kind = lianli_shared::rgb::RgbSyncKind::Continuous;
+    sync.device_order = vec!["screen".into(), "offline".into(), "sync".into()];
+    sync.effect.mode = RgbMode::Rainbow;
+    controller.validate_config(&config).unwrap();
+    controller.apply_config(&config, &[]);
+    waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+    controller.set_night_mode(true).unwrap();
+    assert!(controller.native_night_mode_engaged());
+    release.send(()).unwrap();
+    assert!(received
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .iter()
+        .any(|color| *color != [0; 3]));
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        [[0; 3]; 9]
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sync output never became black"
+        );
+        if other
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .iter()
+            .all(|color| *color == [0; 3])
+        {
+            break;
+        }
+    }
+    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(other.try_recv().is_err());
+    let original = config.clone();
+    let sync = config.merge_lighting.as_mut().unwrap();
+    sync.effect.mode = RgbMode::Static;
+    sync.effect.colors = vec![[0, 0, 255]];
+    sync.device_order.reverse();
+    controller.validate_config(&config).unwrap();
+    controller.apply_config(&config, &[]);
+    controller.set_night_mode(true).unwrap();
+    assert_eq!(controller.config.as_ref(), Some(&config));
+    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(other.try_recv().is_err());
+    let mut removed = config.clone();
+    removed
+        .merge_lighting
+        .as_mut()
+        .unwrap()
+        .device_order
+        .retain(|id| id != "sync");
+    assert!(controller
+        .validate_config(&removed)
+        .unwrap_err()
+        .to_string()
+        .contains("Disable Night Mode"));
+    controller.set_night_mode(false).unwrap();
+    for frame in [
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        other.recv_timeout(Duration::from_secs(1)).unwrap(),
+    ] {
+        assert!(frame
+            .iter()
+            .all(|color| color[0] == 0 && color[1] == 0 && color[2] > 0));
+    }
+    assert_eq!(
+        controller.sync_active,
+        std::collections::HashSet::from(["screen".into(), "sync".into()])
+    );
+    assert!(original.merge_lighting.unwrap().enabled);
+    assert!(config.merge_lighting.as_ref().unwrap().enabled);
+    controller.set_night_mode(false).unwrap();
+    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(other.try_recv().is_err());
+}
+
+#[test]
+fn missing_cached_wireless_sync_target_does_not_prevent_healthy_blackout() {
+    let (mut controller, config, received) = setup();
+    controller.wireless = Some(Arc::new(WirelessController::new()));
+    controller.apply_config(&config, &[]);
+    received.recv_timeout(Duration::from_secs(1)).unwrap();
+    controller.wireless_state.insert(
+        "wireless".into(),
+        WirelessDevice {
+            mac: [1; 6],
+            fan_type: WirelessFanType::SlV4,
+            fan_count: 1,
+            right_attach: false,
+        },
+    );
+    controller.sync_active.insert("wireless".into());
+    controller
+        .config
+        .as_mut()
+        .unwrap()
+        .merge_lighting
+        .as_mut()
+        .unwrap()
+        .device_order
+        .push("wireless".into());
+    let error = controller.set_night_mode(true).unwrap_err().to_string();
+    assert!(error.contains("wireless"));
+    assert!(controller.native_night_mode_engaged());
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "healthy sync output never became black"
+        );
+        let frame = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        if frame.iter().all(|color| *color == [0; 3]) {
+            break;
+        }
+    }
+    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    controller.wireless_state.clear();
+    controller.set_night_mode(true).unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        [[0; 3]; 60]
+    );
+    controller.set_night_mode(false).unwrap();
+    assert!(received
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .iter()
+        .all(|color| color[1] > 0));
+}
+
+#[test]
+fn matched_hardware_merge_blackout_restores_current_sync_effect() {
+    let (mut controller, mut config, _) = setup();
+    let device = Arc::new(CountedFan::default());
+    device.count.store(24, std::sync::atomic::Ordering::Relaxed);
+    controller.replace_wired(HashMap::from([(
+        "screen".into(),
+        device.clone() as Arc<dyn RgbDevice>,
+    )]));
+    config.merge_lighting.as_mut().unwrap().kind = lianli_shared::rgb::RgbSyncKind::Matched;
+    controller.apply_config(&config, &[]);
+    device.applied.lock().clear();
+    controller.set_night_mode(true).unwrap();
+    assert!(controller.native_night_mode_engaged());
+    assert_eq!(device.applied.lock().as_slice(), [(24, [0; 3])]);
+    config.merge_lighting.as_mut().unwrap().effect.colors = vec![[0, 0, 255]];
+    controller.validate_config(&config).unwrap();
+    controller.apply_config(&config, &[]);
+    assert_eq!(device.applied.lock().as_slice(), [(24, [0; 3])]);
+    controller.set_night_mode(false).unwrap();
+    assert_eq!(
+        device.applied.lock().as_slice(),
+        [(24, [0; 3]), (24, [0, 0, 255])]
+    );
+}
+
+#[test]
+fn night_mode_restores_updated_merge_led_count_after_thermal_alert_clears() {
+    let (mut controller, mut config, _) = setup();
+    let device = Arc::new(CountedFan::default());
+    controller.replace_wired(HashMap::from([(
+        "screen".into(),
+        device.clone() as Arc<dyn RgbDevice>,
+    )]));
+    config.merge_lighting.as_mut().unwrap().kind = lianli_shared::rgb::RgbSyncKind::Matched;
+    controller.apply_config(&config, &[]);
+    controller.set_night_mode(true).unwrap();
+    config.devices[0].fan_led_count = Some(50);
+    controller.validate_config(&config).unwrap();
+    controller.apply_config(&config, &[]);
+    assert_eq!(device.applied.lock().last(), Some(&(24, [0; 3])));
+    *controller.thermal_override.lock() = Some([255, 128, 0]);
+    controller.set_night_mode(false).unwrap();
+    assert_eq!(device.applied.lock().last(), Some(&(24, [255, 128, 0])));
+    *controller.thermal_override.lock() = None;
+    assert!(!controller.check_thermal_override());
+    assert_eq!(device.applied.lock().last(), Some(&(50, [0, 255, 0])));
+}
+
+#[test]
+fn night_mode_keeps_sync_config_changes_dark_until_release() {
+    let (mut controller, mut config, received) = setup();
+    controller.apply_config(&config, &[]);
+    received.recv_timeout(Duration::from_secs(1)).unwrap();
+    controller.set_night_mode(true).unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        [[0; 3]; 60]
+    );
+    config.merge_lighting.as_mut().unwrap().effect.colors = vec![[0, 0, 255]];
+    controller.validate_config(&config).unwrap();
+    controller.apply_config(&config, &[]);
+    controller.set_night_mode(true).unwrap();
+    assert!(received.recv_timeout(Duration::from_millis(80)).is_err());
+    controller.set_night_mode(false).unwrap();
+    let frame = received.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(frame
+        .iter()
+        .all(|color| color[0] == 0 && color[1] == 0 && color[2] > 0));
+    assert!(controller.sync_active.contains("screen"));
+}
+
+#[test]
+fn night_mode_releases_the_latest_software_preset_colors() {
+    let (mut controller, mut config, received) = setup();
+    config.merge_lighting = None;
+    config.devices[0].active_preset = Some("Palette".into());
+    let mut presets = vec![RgbPreset {
+        name: "Palette".into(),
+        device_id: "screen".into(),
+        zones: vec![RgbPresetZone {
+            zone: 0,
+            colors: vec![[255, 0, 0]; 60],
+            effect: None,
+        }],
+        regions: None,
+    }];
+    controller.apply_config(&config, &presets);
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        [[255, 0, 0]; 60]
+    );
+    controller.set_night_mode(true).unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        [[0; 3]; 60]
+    );
+    presets[0].zones[0].colors = vec![[0, 0, 255]; 60];
+    controller.apply_config(&config, &presets);
+    assert!(received.recv_timeout(Duration::from_millis(80)).is_err());
+    controller.set_night_mode(false).unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(1)).unwrap(),
+        [[0, 0, 255]; 60]
+    );
+}
+
 #[test]
 fn sync_deduplicates_configuration_and_restores_individual_settings() {
     let (mut controller, mut config, received) = setup();
@@ -230,9 +557,9 @@ fn openrgb_release_restores_sync_without_individual_animation_upload() {
     let (mut controller, config, received) = setup();
     controller.apply_config(&config, &[]);
     received.recv_timeout(Duration::from_secs(1)).unwrap();
-    controller.set_openrgb_active(true);
+    controller.set_openrgb_active(true).unwrap();
     assert!(controller.sync_active.is_empty());
-    controller.set_openrgb_active(false);
+    controller.set_openrgb_active(false).unwrap();
     let frame = received.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(frame.iter().all(|rgb| rgb[0] == 0 && rgb[1] > 0));
     assert!(received.recv_timeout(Duration::from_millis(80)).is_err());

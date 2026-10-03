@@ -19,6 +19,114 @@ const PROFILES: &[(Family, u8, u16)] = &[
 ];
 
 #[test]
+fn continuous_blackout_preserves_mixed_wired_and_wireless_sync_delivery() {
+    use lianli_devices::traits::RgbFrameDelivery;
+    use std::cell::RefCell;
+
+    struct SyncFan;
+    impl RgbDevice for SyncFan {
+        fn device_name(&self) -> String {
+            "Sync fan".into()
+        }
+        fn supported_modes(&self) -> Vec<RgbMode> {
+            vec![RgbMode::Static]
+        }
+        fn zone_info(&self) -> Vec<RgbZoneInfo> {
+            vec![RgbZoneInfo {
+                name: "Lighting".into(),
+                led_count: 26,
+            }]
+        }
+        fn software_render_profile(&self) -> Option<RgbRenderProfile> {
+            Some(RgbRenderProfile {
+                family: Family::Tl,
+                fan_count: 1,
+                led_count: 26,
+                right_attach: false,
+            })
+        }
+        fn software_frame_delivery(&self) -> Option<RgbFrameDelivery> {
+            Some(RgbFrameDelivery::LoopUpload)
+        }
+        fn set_zone_effect(&self, _: u8, _: &RgbEffect) -> Result<()> {
+            panic!("planning must not deliver RGB")
+        }
+    }
+    let mut controller = RgbController::new(
+        HashMap::from([("wired".into(), Arc::new(SyncFan) as Arc<dyn RgbDevice>)]),
+        None,
+    );
+    controller.wireless_state.insert(
+        "wireless".into(),
+        WirelessDevice {
+            mac: [1; 6],
+            fan_type: WirelessFanType::SlV4,
+            fan_count: 1,
+            right_attach: false,
+        },
+    );
+    let mut config = RgbAppConfig {
+        merge_lighting: Some(MergeLightingConfig {
+            enabled: true,
+            device_order: vec!["wired".into(), "offline".into(), "wireless".into()],
+            effect: RgbEffect {
+                mode: RgbMode::Rainbow,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for (blackout, blue) in [(false, false), (true, false), (false, true)] {
+        if blue {
+            config.merge_lighting.as_mut().unwrap().effect = RgbEffect {
+                colors: vec![[0, 0, 255]],
+                ..Default::default()
+            };
+        }
+        let uploaded = RefCell::new(Vec::new());
+        let plan = controller
+            .prepare_sync_with(&config, blackout, None, |mac, animation, projected| {
+                assert_eq!(mac, &[1; 6]);
+                assert!(projected);
+                assert!(animation.frames.iter().all(|frame| frame.len() == 52));
+                uploaded.replace(animation.frames.clone());
+                WirelessRgbUpload::with_timing(&animation.frames, animation.timing(), None)
+            })
+            .unwrap();
+        assert_eq!(
+            plan.iter().map(PreparedSync::id).collect::<Vec<_>>(),
+            ["wired", "wireless"]
+        );
+        let PreparedSync::Wired { animation, .. } = &plan[0] else {
+            panic!("wired delivery path lost")
+        };
+        let PreparedSync::Wireless { upload, .. } = &plan[1] else {
+            panic!("wireless delivery path lost")
+        };
+        assert_eq!(usize::from(upload.frame_count()), uploaded.borrow().len());
+        if blackout {
+            assert_eq!(animation.frames.len(), 1);
+            assert_eq!(upload.frame_count(), 1);
+        }
+        for frames in [&animation.frames, &*uploaded.borrow()] {
+            assert!(frames.iter().all(|frame| !frame.is_empty()));
+            if blackout {
+                assert!(frames.iter().flatten().all(|color| *color == [0; 3]));
+            } else {
+                assert!(frames.iter().flatten().any(|color| *color != [0; 3]));
+                if blue {
+                    assert!(frames
+                        .iter()
+                        .flatten()
+                        .all(|color| color[0] == 0 && color[1] == 0));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn native_sync_runway_uses_first_color_for_the_moving_stripe() {
     for &(family, fan_count, led_count) in PROFILES {
         for colors in [

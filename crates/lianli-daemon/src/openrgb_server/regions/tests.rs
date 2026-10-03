@@ -658,7 +658,7 @@ impl RgbDevice for RecordingDevice {
 }
 
 #[test]
-fn night_mode_blocks_native_openrgb_groups_and_resumes_pending_palettes() {
+fn night_mode_bypass_preserves_native_openrgb_group_delivery() {
     let (tx, rx) = std::sync::mpsc::channel();
     let cap = capabilities(3);
     let rgb = Arc::new(Mutex::new(RgbController::new(
@@ -668,10 +668,11 @@ fn night_mode_blocks_native_openrgb_groups_and_resumes_pending_palettes() {
         )]),
         None,
     )));
-    rgb.lock().set_openrgb_active(true);
+    rgb.lock().set_openrgb_active(true).unwrap();
+    let generation = rgb.lock().output_resume_generation();
     rgb.lock().set_night_mode(true).unwrap();
-    let off = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert!(off.iter().all(|effect| effect.mode == RgbMode::Off));
+    assert!(!rgb.lock().output_override_active());
+    assert!(rx.try_recv().is_err());
     let buffer = Arc::new(Mutex::new(DirectColorBuffer::new()));
     let mut group = group();
     group
@@ -680,11 +681,12 @@ fn night_mode_blocks_native_openrgb_groups_and_resumes_pending_palettes() {
     let stop = Arc::new(AtomicBool::new(false));
     let writer =
         crate::controllers::rgb::start_direct_color_writer(rgb.clone(), buffer, stop.clone());
-    assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
-    rgb.lock().set_night_mode(false).unwrap();
     let effects = rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(effects.len(), 2);
     assert!(effects.iter().all(|effect| effect.colors == [[1, 2, 3]; 3]));
+    rgb.lock().set_night_mode(false).unwrap();
+    assert_eq!(rgb.lock().output_resume_generation(), generation);
+    assert!(rx.try_recv().is_err());
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
     rgb.lock().stop();
@@ -701,7 +703,7 @@ fn writer_uses_one_group_call_for_all_fans_and_records_success() {
         )]),
         None,
     )));
-    rgb.lock().set_openrgb_active(true);
+    rgb.lock().set_openrgb_active(true).unwrap();
     let buffer = Arc::new(Mutex::new(DirectColorBuffer::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let mut group = group();
@@ -744,7 +746,7 @@ fn completed_group_write_is_cached_only_for_the_device_that_received_it() {
             HashMap::from([(id.clone(), device.clone())]),
             None,
         )));
-        rgb.lock().set_openrgb_active(true);
+        rgb.lock().set_openrgb_active(true).unwrap();
         let buffer = Arc::new(Mutex::new(DirectColorBuffer::new()));
         group().queue_current(&buffer);
         let stop = Arc::new(AtomicBool::new(false));

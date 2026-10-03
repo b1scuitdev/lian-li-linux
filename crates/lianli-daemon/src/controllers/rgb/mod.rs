@@ -59,6 +59,7 @@ pub struct RgbController {
     openrgb_server_enabled: bool,
     thermal_override: crate::thermal_alert::SharedThermalAlert,
     night_mode_active: bool,
+    native_night_mode_restore_pending: bool,
     output_override: Arc<parking_lot::RwLock<Option<RgbEffect>>>,
     override_revision: Option<u64>,
     override_error: Option<String>,
@@ -96,6 +97,7 @@ impl RgbController {
             openrgb_server_enabled: false,
             thermal_override: crate::thermal_alert::new_shared(),
             night_mode_active: false,
+            native_night_mode_restore_pending: false,
             output_override: Arc::new(parking_lot::RwLock::new(None)),
             override_revision: None,
             override_error: None,
@@ -257,16 +259,21 @@ impl RgbController {
         self.openrgb_active || self.openrgb_server_enabled
     }
 
-    pub fn set_openrgb_active(&mut self, active: bool) {
+    pub fn set_openrgb_active(&mut self, active: bool) -> anyhow::Result<()> {
         if self.openrgb_active == active {
-            return;
+            return Ok(());
         }
+        anyhow::ensure!(
+            !active || !self.native_night_mode_engaged(),
+            "Disable Night Mode before enabling OpenRGB ownership"
+        );
+        self.release_native_night_mode()?;
         self.openrgb_active = active;
         if self.output_override_active() {
             if let Err(error) = self.refresh_output_override(true) {
                 warn!("RGB override failed: {error:#}");
             }
-            return;
+            return Ok(());
         }
         self.clear_pending();
         if !active && !self.openrgb_server_enabled {
@@ -274,6 +281,7 @@ impl RgbController {
                 self.apply_config(&config, &self.presets.clone());
             }
         }
+        Ok(())
     }
 
     pub fn get_zone_colors(&self, id: &str, zone: u8) -> Option<Vec<[u8; 3]>> {

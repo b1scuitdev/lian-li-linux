@@ -453,7 +453,7 @@ impl State {
     pub fn apply_mode(&mut self, command: &Command, rgb: &mut RgbController) -> anyhow::Result<()> {
         match command {
             Command::Custom => {
-                rgb.set_openrgb_active(true);
+                rgb.set_openrgb_active(true)?;
                 self.active = 0;
                 for zone in &mut self.zones {
                     zone.active_mode = -1;
