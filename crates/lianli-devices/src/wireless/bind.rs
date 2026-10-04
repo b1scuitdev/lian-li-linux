@@ -9,7 +9,194 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+#[cfg(feature = "force-wireless-rebind")]
+struct DiagnosticBindPlan {
+    device: DiscoveredDevice,
+    master: [u8; 6],
+    channel: u8,
+    rx: u8,
+    outer_rx: u8,
+    slot: u8,
+    data: Vec<u8>,
+}
+
 impl WirelessController {
+    #[cfg(feature = "force-wireless-rebind")]
+    pub fn diagnostic_poll(&self, mac: [u8; 6]) -> Result<()> {
+        anyhow::ensure!(
+            self.poll_thread.is_none()
+                && self.convergence_thread.is_none()
+                && !self.rx_running.load(std::sync::atomic::Ordering::Acquire),
+            "diagnostic requires an exclusive controller without workers"
+        );
+        let mut capture = self.receiver_state.diagnostic.lock();
+        if capture.is_none() {
+            *capture = Some(super::discovery::RawDiagnostic {
+                target: mac,
+                latest: None,
+                sightings: 0,
+                occupied: [false; RX_SLOT_LIMIT as usize],
+                attempted: false,
+            });
+        }
+        anyhow::ensure!(
+            capture.as_ref().unwrap().target == mac,
+            "diagnostic target changed"
+        );
+        drop(capture);
+        poll_and_discover(
+            self.rx.as_ref().context("RX not connected")?,
+            &self.discovered_devices,
+            &self.device_health,
+            &self.master_entries,
+            &self.receiver_state,
+            &self.poll_stop,
+            &self.master_mac,
+        )
+    }
+
+    #[cfg(feature = "force-wireless-rebind")]
+    fn diagnostic_bind_plan(&self, mac: &[u8; 6]) -> Result<DiagnosticBindPlan> {
+        anyhow::ensure!(
+            self.poll_thread.is_none()
+                && self.convergence_thread.is_none()
+                && !self.rx_running.load(std::sync::atomic::Ordering::Acquire),
+            "diagnostic requires an exclusive controller without workers"
+        );
+        let master = *self.master_mac.lock();
+        let channel = *self.master_channel.lock();
+        anyhow::ensure!(
+            master != [0; 6] && master != [0xff; 6] && (1..=39).contains(&channel),
+            "valid current master MAC/channel unavailable"
+        );
+        let capture = self.receiver_state.diagnostic.lock();
+        let capture = capture.as_ref().context("no raw diagnostic capture")?;
+        anyhow::ensure!(
+            capture.target == *mac && !capture.attempted && capture.sightings >= 3,
+            "need at least three target sightings and no previous attempt"
+        );
+        let (raw, seen) = capture.latest.context("target not seen")?;
+        anyhow::ensure!(
+            seen.elapsed() <= super::discovery::ACK_FRESHNESS,
+            "target raw sighting is stale"
+        );
+        anyhow::ensure!(
+            raw[41] == 0x1c
+                && raw[12] == 0
+                && raw[18] == 0
+                && (1..=4).contains(&raw[19])
+                && raw[24..28].iter().any(|kind| (23..=26).contains(kind)),
+            "target is not a malformed channel-zero SL V3 LCD fan group"
+        );
+        let raw_master: [u8; 6] = raw[6..12].try_into().unwrap();
+        anyhow::ensure!(
+            raw_master == master || raw_master == [0; 6],
+            "target reports a different master; refusing to claim it"
+        );
+        let healthy = self.devices();
+        anyhow::ensure!(
+            healthy.len() < 10,
+            "at most ten wireless devices can be bound"
+        );
+        anyhow::ensure!(
+            healthy.iter().all(|device| device.channel == channel),
+            "healthy devices disagree with the current master channel"
+        );
+        let first_free = self.get_rx_unused()?;
+        let health = self.device_health.lock();
+        let rx = (first_free..RX_SLOT_LIMIT)
+            .find(|rx| {
+                !capture.occupied[usize::from(*rx)]
+                    && health
+                        .values()
+                        .all(|h| h.raw_rx != *rx && h.published.rx_type != *rx)
+            })
+            .context("no safely unoccupied RX slot")?;
+        drop(health);
+        let device = DiscoveredDevice {
+            mac: *mac,
+            master_mac: raw_master,
+            channel,
+            rx_type: 0,
+            device_type: raw[18],
+            fan_count: raw[19],
+            is_inf_right_attach: false,
+            fan_types: raw[24..28].try_into().unwrap(),
+            fan_rpms: [0; 4],
+            current_pwm: raw[36..40].try_into().unwrap(),
+            cmd_seq: raw[40],
+            fan_type: WirelessFanType::Slv3Lcd,
+            list_index: 0,
+            coolant_temp_c: None,
+            effect_index: [0; 4],
+            is_sync_mb_light: false,
+            is_pwm_line_on: false,
+            bind_intent: false,
+        };
+        let slot = self.next_slot_index(&device);
+        let data = build_bind_packet(&device, &master, rx, channel, slot);
+        Ok(DiagnosticBindPlan {
+            device,
+            master,
+            channel,
+            rx,
+            outer_rx: 0xff,
+            slot,
+            data,
+        })
+    }
+
+    #[cfg(feature = "force-wireless-rebind")]
+    pub fn diagnostic_force_rebind(&self, mac: &[u8; 6]) -> Result<bool> {
+        let _binding = self.begin_binding(mac)?;
+        let DiagnosticBindPlan {
+            device,
+            master,
+            channel,
+            rx,
+            outer_rx,
+            slot,
+            data,
+        } = self.diagnostic_bind_plan(mac)?;
+        info!(target = %device.mac_str(), master = %hex::encode(master), channel, rx,
+            slot, outer_rx = "0xFF", payload = %hex::encode(&data),
+            "Force-rebind: sending exactly one RF transaction");
+        self.receiver_state
+            .diagnostic
+            .lock()
+            .as_mut()
+            .unwrap()
+            .attempted = true;
+        let sent_at = Instant::now();
+        {
+            // Do not replay a partially transmitted diagnostic transaction.
+            let tx = self.tx.as_ref().context("TX not connected")?.lock();
+            self.send_rf_packet_addressed(tx.get()?, channel, outer_rx, &data)?;
+        }
+        info!("Force-rebind packet sent; observing without further binds");
+        let mut converged = false;
+        for _ in 0..30 {
+            thread::sleep(Duration::from_millis(500));
+            self.diagnostic_poll(*mac)?;
+            let matched = self.device_health.lock().get(mac).is_some_and(|h| {
+                h.raw_seen >= sent_at
+                    && h.raw_master == master
+                    && h.raw_channel == channel
+                    && h.raw_rx == rx
+            });
+            if matched && !converged {
+                self.confirm_binding(mac, true);
+                converged = true;
+                info!(target = %device.mac_str(), channel, rx, "Force-rebind converged");
+            }
+        }
+        Ok(converged
+            && self
+                .devices()
+                .iter()
+                .any(|d| d.mac == *mac && d.channel == channel && d.rx_type == rx))
+    }
+
     pub fn bind_device(&self, mac: &[u8; 6]) -> Result<()> {
         let _binding = self.begin_binding(mac)?;
         self.check_bind_allowed(mac)?;
@@ -299,6 +486,10 @@ fn build_bind_packet(
 
 struct BindingGuard(std::sync::Arc<parking_lot::Mutex<Option<[u8; 6]>>>);
 
+#[cfg(all(test, feature = "force-wireless-rebind"))]
+#[path = "force_rebind_tests.rs"]
+mod force_rebind_tests;
+
 impl Drop for BindingGuard {
     fn drop(&mut self) {
         *self.0.lock() = None;
@@ -310,7 +501,7 @@ mod tests {
     use super::super::discovery::{DeviceHealth, MasterEntry};
     use super::*;
 
-    fn controller_with(local: [u8; 6], foreign_online: bool) -> WirelessController {
+    pub(super) fn controller_with(local: [u8; 6], foreign_online: bool) -> WirelessController {
         let c = WirelessController::new();
         *c.master_mac.lock() = local;
         if foreign_online {
@@ -326,7 +517,12 @@ mod tests {
         c
     }
 
-    fn seed_device(c: &WirelessController, mac: &[u8; 6], master: [u8; 6], intent: bool) {
+    pub(super) fn seed_device(
+        c: &WirelessController,
+        mac: &[u8; 6],
+        master: [u8; 6],
+        intent: bool,
+    ) {
         let rec = super::super::discovery::DiscoveredDevice {
             mac: *mac,
             master_mac: master,

@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 const DISCOVERY_WINDOW: Duration = Duration::from_secs(5);
 
 fn main() -> Result<()> {
+    if std::env::args().len() > 1 {
+        #[cfg(feature = "force-wireless-rebind")]
+        return diagnostic_main();
+        #[cfg(not(feature = "force-wireless-rebind"))]
+        anyhow::bail!("diagnostic arguments require the force-wireless-rebind feature");
+    }
     eprintln!("lianli bind tool — stop the daemon before running");
     eprintln!();
 
@@ -63,6 +69,48 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "force-wireless-rebind")]
+fn diagnostic_main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    anyhow::ensure!(
+        args.len() == 2 && matches!(args[0].as_str(), "--force-rebind" | "--observe-only"),
+        "usage: bind_tool --force-rebind|--observe-only MAC (daemon must be stopped)"
+    );
+    let bytes = hex::decode(args[1].replace(':', ""))?;
+    let mac: [u8; 6] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected six MAC bytes"))?;
+    anyhow::ensure!(mac != [0; 6] && mac != [0xff; 6], "invalid target MAC");
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(io::stderr)
+        .init();
+    eprintln!(
+        "Exclusive diagnostic for {}: daemon must be stopped",
+        args[1]
+    );
+    let mut ctrl = WirelessController::new();
+    ctrl.connect().context("connecting to dongles")?;
+    let result = (|| -> Result<()> {
+        for _ in 0..20 {
+            ctrl.diagnostic_poll(mac)?;
+            thread::sleep(Duration::from_millis(500));
+        }
+        eprintln!("Published devices before attempt:");
+        print_device_list(&ctrl.devices());
+        if args[0] == "--force-rebind" {
+            let converged = ctrl.diagnostic_force_rebind(&mac)?;
+            eprintln!("Convergence and published discovery: {converged}");
+            print_device_list(&ctrl.devices());
+            anyhow::ensure!(converged, "one-shot recovery did not converge");
+        }
+        Ok(())
+    })();
+    ctrl.stop();
+    result
 }
 
 enum Action {

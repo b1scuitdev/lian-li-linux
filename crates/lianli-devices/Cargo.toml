@@ -3,6 +3,9 @@ name = "lianli-devices"
 version.workspace = true
 edition.workspace = true
 
+[features]
+force-wireless-rebind = []
+
 [dependencies]
 lianli-shared = { path = "../lianli-shared" }
 lianli-transport = { path = "../lianli-transport" }

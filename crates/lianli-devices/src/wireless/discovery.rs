@@ -464,6 +464,80 @@ pub(super) struct ReceiverState {
     pub pwm: AtomicU16,
     pub pages: AtomicU8,
     pub fg_sync: AtomicBool,
+    #[cfg(feature = "force-wireless-rebind")]
+    pub diagnostic: Mutex<Option<RawDiagnostic>>,
+}
+
+#[cfg(feature = "force-wireless-rebind")]
+pub(super) struct RawDiagnostic {
+    pub target: [u8; 6],
+    pub latest: Option<([u8; 42], Instant)>,
+    pub sightings: usize,
+    pub occupied: [bool; RX_SLOT_LIMIT as usize],
+    pub attempted: bool,
+}
+
+#[cfg(feature = "force-wireless-rebind")]
+impl RawDiagnostic {
+    fn observe(&mut self, record: &[u8]) {
+        if record.len() != 42 {
+            return;
+        }
+        if record[41] == 0x1c && record[18] != 0xff && is_valid_rx(record[13]) {
+            self.occupied[usize::from(record[13])] = true;
+        }
+        if record[..6] != self.target {
+            return;
+        }
+        let raw: [u8; 42] = record.try_into().unwrap();
+        self.latest = Some((raw, Instant::now()));
+        self.sightings += 1;
+        info!(raw = %hex::encode(raw), mac = %hex::encode(self.target),
+            master = %hex::encode(&raw[6..12]), channel = raw[12], rx = raw[13],
+            device_type = raw[18], fan_count = raw[19], cmd_seq = raw[40],
+            marker = raw[41], "Force-rebind raw target sighting");
+    }
+}
+
+#[cfg(all(test, feature = "force-wireless-rebind"))]
+mod raw_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_target_is_captured_without_entering_discovery() {
+        let target = [0x8b, 0x92, 0xcc, 0x88, 0x19, 0x70];
+        let mut capture = RawDiagnostic {
+            target,
+            latest: None,
+            sightings: 0,
+            occupied: [false; RX_SLOT_LIMIT as usize],
+            attempted: false,
+        };
+        let mut raw = [0; 42];
+        raw[..6].copy_from_slice(&target);
+        raw[13] = 55;
+        raw[19] = 3;
+        raw[24] = 23;
+        raw[41] = 0x1c;
+        let health = Arc::new(Mutex::new(Default::default()));
+        let devices = Arc::new(Mutex::new(Vec::new()));
+        let master = Arc::new(Mutex::new([9; 6]));
+        for _ in 0..5 {
+            capture.observe(&raw);
+            let parsed: Vec<_> = parse_device_record(&raw, 0).into_iter().collect();
+            merge_sightings(&parsed, &health, &devices, &master);
+        }
+        assert_eq!(capture.sightings, 5);
+        assert_eq!(capture.latest.unwrap().0, raw);
+        assert!(health.lock().is_empty());
+        assert!(devices.lock().is_empty());
+        raw[0] = 1;
+        raw[13] = 3;
+        capture.observe(&raw);
+        assert!(capture.occupied[3]);
+        assert_eq!(capture.sightings, 5);
+        assert_eq!(capture.latest.unwrap().0[13], 55);
+    }
 }
 
 impl Default for ReceiverState {
@@ -472,6 +546,8 @@ impl Default for ReceiverState {
             pwm: AtomicU16::new(0xFFFF),
             pages: AtomicU8::new(1),
             fg_sync: AtomicBool::new(false),
+            #[cfg(feature = "force-wireless-rebind")]
+            diagnostic: Mutex::new(None),
         }
     }
 }
@@ -568,6 +644,11 @@ pub(super) fn poll_and_discover(
                 if offset + 42 > len {
                     debug!("GetDev: response truncated at device {idx}");
                     break;
+                }
+
+                #[cfg(feature = "force-wireless-rebind")]
+                if let Some(diagnostic) = receiver.diagnostic.lock().as_mut() {
+                    diagnostic.observe(&response[offset..offset + 42]);
                 }
 
                 if let Some((mac, channel)) = parse_master_record(&response[offset..offset + 42]) {
